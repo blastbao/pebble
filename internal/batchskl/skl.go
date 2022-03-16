@@ -165,6 +165,7 @@ func (s *Skiplist) Reset() {
 
 // Init the skiplist to empty and re-initialize.
 func (s *Skiplist) Init(storage *[]byte, cmp base.Compare, abbreviatedKey base.AbbreviatedKey) {
+
 	*s = Skiplist{
 		storage:        storage,
 		cmp:            cmp,
@@ -172,6 +173,7 @@ func (s *Skiplist) Init(storage *[]byte, cmp base.Compare, abbreviatedKey base.A
 		nodes:          s.nodes[:0],
 		height:         1,
 	}
+
 	s.rand.Seed(uint64(time.Now().UnixNano()))
 
 	const initBufSize = 256

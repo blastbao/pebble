@@ -2365,6 +2365,9 @@ func (r *Reader) transformRangeDelV1(b []byte) ([]byte, error) {
 }
 
 func (r *Reader) readMetaindex(metaindexBH BlockHandle) error {
+
+
+	// 1、根据 metaindexBH，加载元数据 BH 信息
 	b, err := r.readBlock(metaindexBH, nil /* transform */, nil /* readaheadState */)
 	if err != nil {
 		return err
@@ -2394,6 +2397,8 @@ func (r *Reader) readMetaindex(metaindexBH BlockHandle) error {
 		return err
 	}
 
+
+	// 2、根据元数据 BH 信息，加载 rocksdb.properties 元数据信息
 	if bh, ok := meta[metaPropertiesName]; ok {
 		b, err = r.readBlock(bh, nil /* transform */, nil /* readaheadState */)
 		if err != nil {
@@ -2407,6 +2412,8 @@ func (r *Reader) readMetaindex(metaindexBH BlockHandle) error {
 		}
 	}
 
+
+	// 3、根据元数据 BH 信息，加载 rocksdb.range_del 元数据信息
 	if bh, ok := meta[metaRangeDelV2Name]; ok {
 		r.rangeDelBH = bh
 	} else if bh, ok := meta[metaRangeDelName]; ok {
@@ -2708,6 +2715,11 @@ type ReadableFile interface {
 
 // NewReader returns a new table reader for the file. Closing the reader will
 // close the file.
+//
+//
+//
+//
+//
 func NewReader(f ReadableFile, o ReaderOptions, extraOpts ...ReaderOption) (*Reader, error) {
 	o = o.ensureDefaults()
 	r := &Reader{
@@ -2738,6 +2750,7 @@ func NewReader(f ReadableFile, o ReaderOptions, extraOpts ...ReaderOption) (*Rea
 		r.cacheID = r.opts.Cache.NewID()
 	}
 
+	// 1、从文件的后 53 字节加载 footer 的信息
 	footer, err := readFooter(f)
 	if err != nil {
 		r.err = err
@@ -2745,11 +2758,15 @@ func NewReader(f ReadableFile, o ReaderOptions, extraOpts ...ReaderOption) (*Rea
 	}
 	r.checksumType = footer.checksum
 	r.tableFormat = footer.format
+
 	// Read the metaindex.
+	// 2、根据 metaindexBH，加载 metaindex 信息，进而加载 properity、range_del、filterBH 等元数据信息
 	if err := r.readMetaindex(footer.metaindexBH); err != nil {
 		r.err = err
 		return nil, r.Close()
 	}
+
+	// 3、把 indexBH 等信息赋值给 reader。
 	r.indexBH = footer.indexBH
 	r.metaIndexBH = footer.metaindexBH
 	r.footerBH = footer.footerBH

@@ -1,3 +1,4 @@
+.idea/
 # Profiling artifacts.
 cpu.*.prof
 heap.prof

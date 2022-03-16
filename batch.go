@@ -49,6 +49,7 @@ var ErrBatchTooLarge = errors.Newf("pebble: batch too large: >= %s", humanize.Ui
 // copy or encode keys/values directly into the batch representation instead of
 // copying into an intermediary buffer then having pebble.Batch copy off of it.
 type DeferredBatchOp struct {
+
 	index *batchskl.Skiplist
 
 	// Key and Value point to parts of the binary batch representation where
@@ -56,6 +57,7 @@ type DeferredBatchOp struct {
 	// bytes must be copied into these slices respectively before calling
 	// Finish(). Changing where these slices point to is not allowed.
 	Key, Value []byte
+
 	offset     uint32
 }
 
@@ -73,11 +75,14 @@ func (d DeferredBatchOp) Finish() error {
 	return nil
 }
 
+
 // A Batch is a sequence of Sets, Merges, Deletes, DeleteRanges, RangeKeySets,
 // RangeKeyUnsets, and/or RangeKeyDeletes that are applied atomically. Batch
 // implements the Reader interface, but only an indexed batch supports reading
 // (without error) via Get or NewIter. A non-indexed batch will return
 // ErrNotIndexed when read from .
+//
+//
 //
 // Indexing
 //
@@ -142,6 +147,8 @@ func (d DeferredBatchOp) Finish() error {
 // The internal batch representation is a contiguous byte buffer with a fixed
 // 12-byte header, followed by a series of records.
 //
+// Batch 内部实现是一个连续的 byte 数组，包含 12B 的头部。
+//
 //   +-------------+------------+--- ... ---+
 //   | SeqNum (8B) | Count (4B) |  Entries  |
 //   +-------------+------------+--- ... ---+
@@ -176,7 +183,10 @@ func (d DeferredBatchOp) Finish() error {
 // The internal batch representation is the on disk format for a batch in the
 // WAL, and thus stable. New record kinds may be added, but the existing ones
 // will not be modified.
+//
+//
 type Batch struct {
+
 	// Data is the wire format of a batch's log entry:
 	//   - 8 bytes for a sequence number of the first batch element,
 	//     or zeroes if the batch has not yet been applied,
@@ -192,6 +202,10 @@ type Batch struct {
 	// batches. Large batches will set the data field to nil when committed as
 	// the data has been moved to a flushableBatch and inserted into the queue of
 	// memtables.
+	//
+	//
+	//
+	//
 	data           []byte
 	cmp            Compare
 	formatKey      base.FormatKey
@@ -205,20 +219,20 @@ type Batch struct {
 	// uint32.
 	memTableSize uint64
 
-	// The db to which the batch will be committed. Do not change this field
-	// after the batch has been created as it might invalidate internal state.
+	// The db to which the batch will be committed.
+	// Do not change this field after the batch has been created as it might invalidate internal state.
 	db *DB
 
-	// The count of records in the batch. This count will be stored in the batch
-	// data whenever Repr() is called.
+	// The count of records in the batch.
+	// This count will be stored in the batch data whenever Repr() is called.
 	count uint64
 
-	// The count of range deletions in the batch. Updated every time a range
-	// deletion is added.
+	// The count of range deletions in the batch.
+	// Updated every time a range deletion is added.
 	countRangeDels uint64
 
-	// The count of range key sets, unsets and deletes in the batch. Updated
-	// every time a RANGEKEYSET, RANGEKEYUNSET or RANGEKEYDEL key is added.
+	// The count of range key sets, unsets and deletes in the batch.
+	// Updated every time a RANGEKEYSET, RANGEKEYUNSET or RANGEKEYDEL key is added.
 	countRangeKeys uint64
 
 	// A deferredOp struct, stored in the Batch so that a pointer can be returned
@@ -226,28 +240,35 @@ type Batch struct {
 	deferredOp DeferredBatchOp
 
 	// An optional skiplist keyed by offset into data of the entry.
-	index         *batchskl.Skiplist
-	rangeDelIndex *batchskl.Skiplist
-	rangeKeyIndex *batchskl.Skiplist
+	// 索引结构，存储了 entry 的 offset 。
+	index         *batchskl.Skiplist	//
+	rangeDelIndex *batchskl.Skiplist	// 被删除的 entry 的 offset
+	rangeKeyIndex *batchskl.Skiplist	//
 
 	// Fragmented range deletion tombstones. Cached the first time a range
 	// deletion iterator is requested. The cache is invalidated whenever a new
 	// range deletion is added to the batch.
+	//
+	//
 	tombstones []keyspan.Span
 
 	// Fragmented range key spans. Cached the first time a range key iterator is
 	// requested. The cache is invalidated whenever a new range key
 	// (RangeKey{Set,Unset,Del}) is added to the batch.
+	//
+	//
+	//
 	rangeKeys []keyspan.Span
 
-	// The flushableBatch wrapper if the batch is too large to fit in the
-	// memtable.
+	// The flushableBatch wrapper if the batch is too large to fit in the memTable.
 	flushable *flushableBatch
+
 
 	commit    sync.WaitGroup
 	commitErr error
 	applied   uint32 // updated atomically
 }
+
 
 var _ Reader = (*Batch)(nil)
 var _ Writer = (*Batch)(nil)
@@ -287,6 +308,7 @@ func newIndexedBatch(db *DB, comparer *Comparer) *Batch {
 }
 
 func (b *Batch) release() {
+
 	if b.db == nil {
 		// The batch was not created using newBatch or newIndexedBatch, or an error
 		// was encountered. We don't try to reuse batches that encountered an error
@@ -295,6 +317,8 @@ func (b *Batch) release() {
 		// let the GC do its job.
 		return
 	}
+
+
 	b.db = nil
 
 	// NB: This is ugly (it would be cleaner if we could just assign a Batch{}),
@@ -322,11 +346,14 @@ func (b *Batch) refreshMemTableSize() {
 
 	b.countRangeDels = 0
 	b.countRangeKeys = 0
+
 	for r := b.Reader(); ; {
+		// 当前 entry
 		kind, key, value, ok := r.Next()
 		if !ok {
 			break
 		}
+		// 更新统计信息
 		b.memTableSize += memTableEntrySize(len(key), len(value))
 		switch kind {
 		case InternalKeyKindRangeDelete:
@@ -341,62 +368,90 @@ func (b *Batch) refreshMemTableSize() {
 //
 // It is safe to modify the contents of the arguments after Apply returns.
 func (b *Batch) Apply(batch *Batch, _ *WriteOptions) error {
+
+	// 底层数据为空
 	if len(batch.data) == 0 {
 		return nil
 	}
+
+	// 底层数据不全
 	if len(batch.data) < batchHeaderLen {
 		return base.CorruptionErrorf("pebble: invalid batch")
 	}
 
+	//
 	offset := len(b.data)
 	if offset == 0 {
 		b.init(offset)
 		offset = batchHeaderLen
 	}
+
 	b.data = append(b.data, batch.data[batchHeaderLen:]...)
 
 	b.setCount(b.Count() + batch.Count())
 
+	//
 	if b.db != nil || b.index != nil {
-		// Only iterate over the new entries if we need to track memTableSize or in
-		// order to update the index.
+
+		// Only iterate over the new entries if we need to track memTableSize or
+		// in order to update the index.
+
+		// 迭代 entries
 		for iter := BatchReader(b.data[offset:]); len(iter) > 0; {
+
+			// ???
 			offset := uintptr(unsafe.Pointer(&iter[0])) - uintptr(unsafe.Pointer(&b.data[0]))
+
+			// 当前 entry
 			kind, key, value, ok := iter.Next()
 			if !ok {
 				break
 			}
+
+			// 统计数据
 			switch kind {
 			case InternalKeyKindRangeDelete:
 				b.countRangeDels++
 			case InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
 				b.countRangeKeys++
 			}
+
+			// 存在索引
 			if b.index != nil {
 				var err error
 				switch kind {
 				case InternalKeyKindRangeDelete:
 					b.tombstones = nil
+					// 不存在则初始化
 					if b.rangeDelIndex == nil {
 						b.rangeDelIndex = batchskl.NewSkiplist(&b.data, b.cmp, b.abbreviatedKey)
 					}
+					// 插入 skl 中
 					err = b.rangeDelIndex.Add(uint32(offset))
 				case InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
 					b.rangeKeys = nil
+					// 不存在则初始化
 					if b.rangeKeyIndex == nil {
 						b.rangeKeyIndex = batchskl.NewSkiplist(&b.data, b.cmp, b.abbreviatedKey)
 					}
+					// 插入 skl 中
 					err = b.rangeKeyIndex.Add(uint32(offset))
 				default:
+					// 插入到索引
 					err = b.index.Add(uint32(offset))
 				}
+
+				// 出错则返回
 				if err != nil {
 					return err
 				}
 			}
+
+			// 更新统计计数：memTable 的字节大小
 			b.memTableSize += memTableEntrySize(len(key), len(value))
 		}
 	}
+
 	return nil
 }
 
@@ -408,9 +463,11 @@ func (b *Batch) Apply(batch *Batch, _ *WriteOptions) error {
 // slice will remain valid until the returned Closer is closed. On success, the
 // caller MUST call closer.Close() or a memory leak will occur.
 func (b *Batch) Get(key []byte) ([]byte, io.Closer, error) {
+	//
 	if b.index == nil {
 		return nil, nil, ErrNotIndexed
 	}
+	//
 	return b.db.getInternal(key, b, nil /* snapshot */)
 }
 
@@ -428,6 +485,7 @@ func (b *Batch) prepareDeferredKeyValueRecord(keyLen, valueLen int, kind Interna
 	pos++
 
 	{
+
 		// TODO(peter): Manually inlined version binary.PutUvarint(). This is 20%
 		// faster on BenchmarkBatchSet on go1.13. Remove if go1.14 or future
 		// versions show this to not be a performance win.
@@ -437,8 +495,10 @@ func (b *Batch) prepareDeferredKeyValueRecord(keyLen, valueLen int, kind Interna
 			x >>= 7
 			pos++
 		}
+
 		b.data[pos] = byte(x)
 		pos++
+
 	}
 
 	b.deferredOp.Key = b.data[pos : pos+keyLen]
@@ -764,6 +824,8 @@ func (b *Batch) LogData(data []byte, _ *WriteOptions) error {
 }
 
 // Empty returns true if the batch is empty, and false otherwise.
+//
+// Batch 是否为空
 func (b *Batch) Empty() bool {
 	return len(b.data) <= batchHeaderLen
 }
@@ -771,10 +833,13 @@ func (b *Batch) Empty() bool {
 // Repr returns the underlying batch representation. It is not safe to modify
 // the contents. Reset() will not change the contents of the returned value,
 // though any other mutation operation may do so.
+//
+// 返回 Batch 的底层字节数据，修改其内容是不安全的。
 func (b *Batch) Repr() []byte {
 	if len(b.data) == 0 {
 		b.init(batchHeaderLen)
 	}
+	// 设置第 [8:12] 的 4B 为 Count
 	binary.LittleEndian.PutUint32(b.countData(), b.Count())
 	return b.data
 }
@@ -819,17 +884,23 @@ func (b *Batch) newInternalIter(o *IterOptions) internalIterator {
 }
 
 func (b *Batch) newRangeDelIter(_ *IterOptions) keyspan.FragmentIterator {
+
+	//
 	if b.index == nil {
 		return newErrorIter(ErrNotIndexed)
 	}
+
+	//
 	if b.rangeDelIndex == nil {
 		return nil
 	}
 
-	// Fragment the range tombstones the first time a range deletion iterator is
-	// requested. The cached tombstones are invalidated if another range deletion
-	// tombstone is added to the batch.
+	// Fragment the range tombstones the first time a range deletion iterator is requested.
+	// The cached tombstones are invalidated if another range deletion tombstone is added
+	// to the batch.
 	if b.tombstones == nil {
+
+		//
 		frag := &keyspan.Fragmenter{
 			Cmp:    b.cmp,
 			Format: b.formatKey,
@@ -837,11 +908,13 @@ func (b *Batch) newRangeDelIter(_ *IterOptions) keyspan.FragmentIterator {
 				b.tombstones = append(b.tombstones, fragmented...)
 			},
 		}
+
 		it := &batchIter{
 			cmp:   b.cmp,
 			batch: b,
 			iter:  b.rangeDelIndex.NewIter(nil, nil),
 		}
+
 		// The memory management here is a bit subtle. The keys and values returned
 		// by the iterator are slices in Batch.data. Thus the fragmented tombstones
 		// are slices within Batch.data. If additional entries are added to the
@@ -851,9 +924,11 @@ func (b *Batch) newRangeDelIter(_ *IterOptions) keyspan.FragmentIterator {
 		for key, val := it.First(); key != nil; key, val = it.Next() {
 			frag.Add(keyspan.Span{Start: *key, End: val})
 		}
+
 		frag.Finish()
 	}
 
+	//
 	return keyspan.NewIter(b.cmp, b.tombstones)
 }
 
@@ -1019,8 +1094,8 @@ func (b *Batch) Count() uint32 {
 	return uint32(b.count)
 }
 
-// Reader returns a BatchReader for the current batch contents. If the batch is
-// mutated, the new entries will not be visible to the reader.
+// Reader returns a BatchReader for the current batch contents.
+// If the batch is mutated, the new entries will not be visible to the reader.
 func (b *Batch) Reader() BatchReader {
 	if len(b.data) == 0 {
 		b.init(batchHeaderLen)
@@ -1074,25 +1149,39 @@ func ReadBatch(repr []byte) (r BatchReader, count uint32) {
 // Next returns the next entry in this batch. The final return value is false
 // if the batch is corrupt. The end of batch is reached when len(r)==0.
 func (r *BatchReader) Next() (kind InternalKeyKind, ukey []byte, value []byte, ok bool) {
+
+	//
 	if len(*r) == 0 {
 		return 0, nil, nil, false
 	}
+
+	// Kind
 	kind = InternalKeyKind((*r)[0])
 	if kind > InternalKeyKindMax {
 		return 0, nil, nil, false
 	}
+
+	// Decode Key
 	*r, ukey, ok = batchDecodeStr((*r)[1:])
 	if !ok {
 		return 0, nil, nil, false
 	}
+
+	// Decode Value
 	switch kind {
-	case InternalKeyKindSet, InternalKeyKindMerge, InternalKeyKindRangeDelete,
-		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
+	case InternalKeyKindSet,
+			InternalKeyKindMerge,
+			InternalKeyKindRangeDelete,
+			InternalKeyKindRangeKeySet,
+			InternalKeyKindRangeKeyUnset,
+			InternalKeyKindRangeKeyDelete:
 		*r, value, ok = batchDecodeStr(*r)
 		if !ok {
 			return 0, nil, nil, false
 		}
 	}
+
+	// Kind/Key/Value/Exist
 	return kind, ukey, value, true
 }
 
@@ -1263,13 +1352,28 @@ var _ flushable = (*flushableBatch)(nil)
 // interface. This allows the batch to act like a memtable and be placed in the
 // queue of flushable memtables. Note that the flushable batch takes ownership
 // of the batch data.
+//
+//
+// (1) 首先，初始 flushableBatch b ，b 中包含了原始 batch 的数据；
+// (2) 然后迭代 batch，解析 batch 的每个 record 生成 flushableBatchEntry，
+// 	entry 主要包含 record 在 batch 中的偏移 offset，
+// 	record 是 batch 索引号 index（用于计算当前 record 的 seqNum），
+// 	record 的原始 key 在 batch 中的起始偏移和终止位置。
+// 	可以看到 entry 主要记录的是 record 相关的位置和偏移信息，
+// 	根据这些信息可以得到 record 中的 key 和 value。
+// 	将 entry 加入到 b 的 offsets 中，迭代完毕后，b 便拥有了原始 batch 中所有 record 的位置和偏移信息。
+// (3) 最后对 b 进行排序。
 func newFlushableBatch(batch *Batch, comparer *Comparer) *flushableBatch {
+
+
 	b := &flushableBatch{
 		data:      batch.data,
 		cmp:       comparer.Compare,
 		formatKey: comparer.FormatKey,
 		offsets:   make([]flushableBatchEntry, 0, batch.Count()),
 	}
+
+
 	if b.data != nil {
 		// Note that this sequence number is not correct when this batch has not
 		// been applied since the sequence number has not been assigned yet. The
@@ -1282,8 +1386,12 @@ func newFlushableBatch(batch *Batch, comparer *Comparer) *flushableBatch {
 	if len(b.data) > batchHeaderLen {
 		// Non-empty batch.
 		var index uint32
+
+		// 迭代 batch
 		for iter := BatchReader(b.data[batchHeaderLen:]); len(iter) > 0; index++ {
 			offset := uintptr(unsafe.Pointer(&iter[0])) - uintptr(unsafe.Pointer(&b.data[0]))
+
+			// 解析当前 batch record
 			kind, key, _, ok := iter.Next()
 			if !ok {
 				break
@@ -1390,11 +1498,20 @@ func (b *flushableBatch) Len() int {
 	return len(b.offsets)
 }
 
+// Less
+// 可以看到 flushableBatch 的排序规则：
+//	比较 entry 间 key 的大小，比较函数默认为 bytes.Compare，
+//	如果 key 相同则偏移位置大的 key 排前面（偏移越大说明 key 是后写入，代表值越新）。
 func (b *flushableBatch) Less(i, j int) bool {
+	// entry
 	ei := &b.offsets[i]
 	ej := &b.offsets[j]
+
+	// key
 	ki := b.data[ei.keyStart:ei.keyEnd]
 	kj := b.data[ej.keyStart:ej.keyEnd]
+
+	// compare
 	switch c := b.cmp(ki, kj); {
 	case c < 0:
 		return true

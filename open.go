@@ -51,7 +51,15 @@ func TableCacheSize(maxOpenFiles int) int {
 }
 
 // Open opens a DB whose files live in the given directory.
+//
+// 逻辑上大致可以分为 "恢复(或新建) Version 信息" 和 "重放(或初始化) WAL 到 Memtable" 两个步骤。
+//
+// Version 内存结构描述了 SST 的元数据(类似每个 Level 有哪些文件，key range 等)，
+// 可以同时存在多个 Version，所以有 VersionSet，读取操作在使用中的 Version 不能被删除VersionEdit 即对 Version 的变更操作，
+// 回放一组也 VersionEdit 可以还原特定的 VersionManifest 持久化文件可以理解为记录是 versionEdit 的 LOG 文件，
+// Manifest 文件有大小限制来触发新建新 Manifest 来避免太多回放开销，CURRENT 文件则指定当前使用的 Manifest。
 func Open(dirname string, opts *Options) (db *DB, _ error) {
+
 	// Make a copy of the options so that we don't mutate the passed in options.
 	opts = opts.Clone()
 	opts = opts.EnsureDefaults()
@@ -81,6 +89,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		closed:              new(atomic.Value),
 		closedCh:            make(chan struct{}),
 	}
+
 	d.mu.versions = &versionSet{}
 	d.atomic.diskAvailBytes = math.MaxUint64
 	d.mu.versions.diskAvailBytes = d.getDiskAvailableBytesCached
@@ -118,33 +127,47 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	d.tableCache = newTableCacheContainer(opts.TableCache, d.cacheID, dirname, opts.FS, d.opts, tableCacheSize)
 	d.newIters = d.tableCache.newIters
 
+	//
 	d.commit = newCommitPipeline(commitEnv{
 		logSeqNum:     &d.mu.versions.atomic.logSeqNum,
 		visibleSeqNum: &d.mu.versions.atomic.visibleSeqNum,
 		apply:         d.commitApply,
 		write:         d.commitWrite,
 	})
+
+
+	// 压缩 compaction 频控
 	d.compactionLimiter = rate.NewLimiter(
 		rate.Limit(d.opts.private.minCompactionRate),
-		d.opts.private.minCompactionRate)
+		d.opts.private.minCompactionRate,
+	)
+
+	// 刷盘 flush 频控
 	d.flushLimiter = rate.NewLimiter(
 		rate.Limit(d.opts.private.minFlushRate),
-		d.opts.private.minFlushRate)
+		d.opts.private.minFlushRate,
+	)
+
+	// 删除 deletion 频控
 	d.deletionLimiter = rate.NewLimiter(
 		rate.Limit(d.opts.Experimental.MinDeletionRate),
-		d.opts.Experimental.MinDeletionRate)
+		d.opts.Experimental.MinDeletionRate,
+	)
+
 	d.mu.nextJobID = 1
 	d.mu.mem.nextSize = opts.MemTableSize
 	if d.mu.mem.nextSize > initialMemTableSize {
 		d.mu.mem.nextSize = initialMemTableSize
 	}
+
 	d.mu.mem.cond.L = &d.mu.Mutex
 	d.mu.cleaner.cond.L = &d.mu.Mutex
 	d.mu.compact.cond.L = &d.mu.Mutex
 	d.mu.compact.inProgress = make(map[*compaction]struct{})
 	d.mu.snapshots.init()
-	// logSeqNum is the next sequence number that will be assigned. Start
-	// assigning sequence numbers from 1 to match rocksdb.
+
+	// logSeqNum is the next sequence number that will be assigned.
+	// Start assigning sequence numbers from 1 to match rocksdb.
 	d.mu.versions.atomic.logSeqNum = 1
 
 	d.timeNow = time.Now
@@ -166,15 +189,16 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if d.walDirname == "" {
 		d.walDirname = d.dirname
 	}
+
 	if d.walDirname == d.dirname {
 		d.walDir = d.dataDir
 	} else {
 		if !d.opts.ReadOnly {
-			err := opts.FS.MkdirAll(d.walDirname, 0755)
-			if err != nil {
+			if err := opts.FS.MkdirAll(d.walDirname, 0755); err != nil {
 				return nil, err
 			}
 		}
@@ -222,7 +246,6 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		return nil, errors.Wrapf(err, "pebble: database %q", dirname)
 	} else if !exists && !d.opts.ReadOnly && !d.opts.ErrorIfNotExists {
 		// Create the DB if it did not already exist.
-
 		if err := d.mu.versions.create(jobID, dirname, opts, manifestMarker, setCurrent, &d.mu.Mutex); err != nil {
 			return nil, err
 		}
@@ -472,6 +495,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	// finializer limitation by setting a finalizer on another object that is
 	// tied to the lifetime of DB: the DB.closed atomic.Value.
 	dPtr := fmt.Sprintf("%p", d)
+
 	invariants.SetFinalizer(d.closed, func(obj interface{}) {
 		v := obj.(*atomic.Value)
 		if err := v.Load(); err == nil {

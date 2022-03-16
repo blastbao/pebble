@@ -121,12 +121,14 @@ func newMemTable(opts memTableOptions) *memTable {
 		writerRefs: 1,
 		logSeqNum:  opts.logSeqNum,
 	}
+
 	m.tombstones = keySpanCache{
 		cmp:        m.cmp,
 		formatKey:  m.formatKey,
 		skl:        &m.rangeDelSkl,
 		splitValue: rangeDelSplitValue,
 	}
+
 	m.rangeKeys = keySpanCache{
 		cmp:       m.cmp,
 		formatKey: m.formatKey,
@@ -199,11 +201,14 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 	var ins arenaskl.Inserter
 	var tombstoneCount, rangeKeyCount uint32
 	startSeqNum := seqNum
+
 	for r := batch.Reader(); ; seqNum++ {
+
 		kind, ukey, value, ok := r.Next()
 		if !ok {
 			break
 		}
+
 		var err error
 		ikey := base.MakeInternalKey(ukey, seqNum, kind)
 		switch kind {
@@ -331,24 +336,31 @@ func rangeDelSplitValue(
 func (f *keySpanFrags) get(
 	skl *arenaskl.Skiplist, cmp Compare, formatKey base.FormatKey, splitValue splitValue,
 ) []keyspan.Span {
-	f.once.Do(func() {
-		frag := &keyspan.Fragmenter{
-			Cmp:    cmp,
-			Format: formatKey,
-			Emit: func(fragmented []keyspan.Span) {
-				f.spans = append(f.spans, fragmented...)
-			},
-		}
-		it := skl.NewIter(nil, nil)
-		for key, val := it.First(); key != nil; key, val = it.Next() {
-			e, v, err := splitValue(key.Kind(), val)
-			if err != nil {
-				panic(err)
+
+	f.once.Do(
+		func() {
+
+			frag := &keyspan.Fragmenter{
+				Cmp:    cmp,
+				Format: formatKey,
+				Emit: func(fragmented []keyspan.Span) {
+					f.spans = append(f.spans, fragmented...)
+				},
 			}
-			frag.Add(keyspan.Span{Start: *key, End: e, Value: v})
-		}
-		frag.Finish()
-	})
+
+			it := skl.NewIter(nil, nil)
+			for key, val := it.First(); key != nil; key, val = it.Next() {
+				e, v, err := splitValue(key.Kind(), val)
+				if err != nil {
+					panic(err)
+				}
+				frag.Add(keyspan.Span{Start: *key, End: e, Value: v})
+			}
+
+			frag.Finish()
+		},
+	)
+
 	return f.spans
 }
 

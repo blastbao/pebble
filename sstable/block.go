@@ -25,11 +25,11 @@ func uvarintLen(v uint32) int {
 }
 
 type blockWriter struct {
-	restartInterval int
+	restartInterval int				// 几个 entry 来生成一个 restart point
 	nEntries        int
 	nextRestart     int
 	buf             []byte
-	restarts        []uint32
+	restarts        []uint32	// 索引的 entry 的 offset 值
 	curKey          []byte
 	curValue        []byte
 	prevKey         []byte

@@ -126,10 +126,10 @@ const (
 )
 
 const (
-	blockSize            = 32 * 1024
+	blockSize            = 32 * 1024						// 块大小，不会超过这个值
 	blockSizeMask        = blockSize - 1
 	legacyHeaderSize     = 7
-	recyclableHeaderSize = legacyHeaderSize + 4
+	recyclableHeaderSize = legacyHeaderSize + 4 // 11 = 7 + 4
 )
 
 var (

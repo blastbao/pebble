@@ -207,17 +207,25 @@ type ExperimentalWriter interface {
 //	db := pebble.Open(&Options{
 //		Comparer: myComparer,
 //	})
+//
+//
+//
 type DB struct {
+
 	// WARNING: The following struct `atomic` contains fields which are accessed
 	// atomically.
 	//
 	// Go allocations are guaranteed to be 64-bit aligned which we take advantage
 	// of by placing the 64-bit fields which we access atomically at the beginning
 	// of the DB struct. For more information, see https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
+	//
+	//
 	atomic struct {
 		// The count and size of referenced memtables. This includes memtables
 		// present in DB.mu.mem.queue, as well as memtables that have been flushed
 		// but are still referenced by an inuse readState.
+		//
+		//
 		memTableCount    int64
 		memTableReserved int64 // number of bytes reserved in the cache for memtables
 
@@ -238,6 +246,7 @@ type DB struct {
 		diskAvailBytes uint64
 	}
 
+	//
 	cacheID        uint64
 	dirname        string
 	walDirname     string
@@ -247,9 +256,14 @@ type DB struct {
 	merge          Merge
 	split          Split
 	abbreviatedKey AbbreviatedKey
-	// The threshold for determining when a batch is "large" and will skip being
-	// inserted into a memtable.
+
+	// The threshold for determining when a batch is "large" and
+	// will skip being inserted into a memtable.
+	//
+	// 超过此阈值的 batch 不会插入到 memtable 。
 	largeBatchThreshold int
+
+
 	// The current OPTIONS file number.
 	optionsFileNum FileNum
 	// The on-disk size of the current OPTIONS file.
@@ -306,6 +320,7 @@ type DB struct {
 	// examples. This is a common pattern, so be careful about expectations that
 	// DB.mu will be held continuously across a set of calls.
 	mu struct {
+
 		sync.Mutex
 
 		formatVers struct {
@@ -332,6 +347,7 @@ type DB struct {
 		// version set are aligned properly.
 		versions *versionSet
 
+
 		log struct {
 			// The queue of logs, containing both flushed and unflushed logs. The
 			// flushed logs will be a prefix, the unflushed logs a suffix. The
@@ -349,20 +365,30 @@ type DB struct {
 			*record.LogWriter
 		}
 
+
+		//
 		mem struct {
-			// Condition variable used to serialize memtable switching. See
-			// DB.makeRoomForWrite().
+			// Condition variable used to serialize memtable switching.
+			// See DB.makeRoomForWrite().
 			cond sync.Cond
+
 			// The current mutable memTable.
 			mutable *memTable
+
 			// Queue of flushables (the mutable memtable is at end). Elements are
 			// added to the end of the slice and removed from the beginning. Once an
 			// index is set it is never modified making a fixed slice immutable and
 			// safe for concurrent reads.
+			//
+			//
 			queue flushableList
-			// True when the memtable is actively been switched. Both mem.mutable and
-			// log.LogWriter are invalid while switching is true.
+
+
+			// True when the memtable is actively been switched.
+			// Both mem.mutable and log.LogWriter are invalid while switching is true.
 			switching bool
+
+
 			// nextSize is the size of the next memtable. The memtable size starts at
 			// min(256KB,Options.MemTableSize) and doubles each time a new memtable
 			// is allocated up to Options.MemTableSize. This reduces the memory
@@ -370,6 +396,7 @@ type DB struct {
 			// in test environments.
 			nextSize int
 		}
+
 
 		compact struct {
 			// Condition variable used to signal when a flush or compaction has
@@ -484,6 +511,8 @@ var getIterAllocPool = sync.Pool{
 }
 
 func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, error) {
+
+	// 已关闭
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -493,8 +522,8 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 	// compaction. The readState is unref'd by Iterator.Close().
 	readState := d.loadReadState()
 
-	// Determine the seqnum to read at after grabbing the read state (current and
-	// memtables) above.
+	// Determine the seqNum to read at after grabbing the read state (current and
+	// memTables) above.
 	var seqNum uint64
 	if s != nil {
 		seqNum = s.seqNum
@@ -518,8 +547,7 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 		version:  readState.current,
 	}
 
-	// Strip off memtables which cannot possibly contain the seqNum being read
-	// at.
+	// Strip off memtables which cannot possibly contain the seqNum being read at.
 	for len(get.mem) > 0 {
 		n := len(get.mem)
 		if logSeqNum := get.mem[n-1].logSeqNum; logSeqNum < seqNum {
@@ -528,25 +556,31 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 		get.mem = get.mem[:n-1]
 	}
 
+
+	// 构造迭代器
 	i := &buf.dbi
 	*i = Iterator{
-		getIterAlloc: buf,
-		cmp:          d.cmp,
-		equal:        d.equal,
-		iter:         get,
+		getIterAlloc: buf,				//
+		cmp:          d.cmp,			// 比较函数
+		equal:        d.equal,		// 相等函数
+		iter:         get,				//
 		merge:        d.merge,
 		split:        d.split,
 		readState:    readState,
 		keyBuf:       buf.keyBuf,
 	}
 
+	// 没有找到
 	if !i.First() {
-		err := i.Close()
-		if err != nil {
+		// 关闭迭代器，失败报错
+		if err := i.Close(); err != nil {
 			return nil, nil, err
 		}
+		// 没有找到，报错 NotFound
 		return nil, nil, ErrNotFound
 	}
+
+	// 找到了，返回 value
 	return i.Value(), i, nil
 }
 
@@ -554,13 +588,42 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 // for that key; a DB is not a multi-map.
 //
 // It is safe to modify the contents of the arguments after Set returns.
+//
+// 写数据
+//
+// Batch 格式：
+// 	|-        header       -|-   body  -|
+//	+-----------+-----------+---- ... --+
+//	|SeqNum (8B)| Count (4B)|   Entries |
+//	+-----------+-----------+-----------+
+//
+// Batch 由 header 和 body 组成：
+// header 包含 8 字节 SeqNum 和 4 字节 Count，SeqNum 表示 batch 的序列号，Count 表示 Entry 个数。
+// body 由多个 Entry 构成。
+//
+// Entry 格式：
+// +----------+--------+-----+----------+-------+
+// |Kind (1B) | KeyLen | Key | ValueLen | Value |
+// +----------+--------+-----+----------+-------+
+//
+// Kind 表示 Entry 的类型，如 SET、DELETE、MERGE 等，这里写入的类型为 SET 。
+// KeyLen 表示 Key 的大小，为 VInt 类型，最大 4 字节，Key 即为 KeyLen 字节序列，
+// 同理，ValueLen 表示 Value 大小，为 VInt 类型，最大 4 字节，Value 为 ValueLen 字节序列。
+//
 func (d *DB) Set(key, value []byte, opts *WriteOptions) error {
+	// 获取一个 batch
 	b := newBatch(d)
+
+	// 调用 batch.Set() 更新 kv
 	_ = b.Set(key, value, opts)
+
+	// 参数检验
 	if err := d.Apply(b, opts); err != nil {
 		return err
 	}
+
 	// Only release the batch on success.
+	// 执行成功后，释放 batch
 	b.release()
 	return nil
 }
@@ -697,32 +760,48 @@ func (e experimentalDB) RangeKeyDelete(start, end []byte, opts *WriteOptions) er
 // reuse them.
 //
 // It is safe to modify the contents of the arguments after Apply returns.
+//
+//
+// 应用 batch 到 DB 。
 func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
+	// 已关闭？
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
+	// 已提交？
 	if atomic.LoadUint32(&batch.applied) != 0 {
 		panic("pebble: batch already applied")
 	}
+	// 只读操作？
 	if d.opts.ReadOnly {
 		return ErrReadOnly
 	}
+	// 参数合法？
 	if batch.db != nil && batch.db != d {
 		panic(fmt.Sprintf("pebble: batch db mismatch: %p != %p", batch.db, d))
 	}
 
+	// 同步落盘？
 	sync := opts.GetSync()
+
+	// 如果开启同步落盘，但是禁用了 WAL ，则参数冲突，报错
 	if sync && d.opts.DisableWAL {
 		return errors.New("pebble: WAL disabled")
 	}
 
+	// ???
 	if batch.countRangeKeys > 0 {
+
+		//
 		if d.split == nil {
 			return errNoSplit
 		}
+
+		//
 		if d.opts.Experimental.RangeKeys == nil {
 			panic("pebble: range keys require the Experimental.RangeKeys option")
 		}
+
 		if d.FormatMajorVersion() < FormatRangeKeys {
 			panic(fmt.Sprintf(
 				"pebble: range keys require at least format major version %d (current: %d)",
@@ -733,17 +812,27 @@ func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
 		// TODO(jackson): Assert that all range key operands are suffixless.
 	}
 
+
+	// ???
 	if batch.db == nil {
 		batch.refreshMemTableSize()
 	}
+
+
+	// 如果 batch 的大小超过阈值，则该 batch 被视为 large batch，
+	// 这里会调用 newFlushableBatch 方法，根据 batch 生成一个 flushable（可以理解成 immutable memtable）。
 	if int(batch.memTableSize) >= d.largeBatchThreshold {
 		batch.flushable = newFlushableBatch(batch, d.opts.Comparer)
 	}
+
+	//
 	if err := d.commit.Commit(batch, sync); err != nil {
 		// There isn't much we can do on an error here. The commit pipeline will be
 		// horked at this point.
 		d.opts.Logger.Fatalf("%v", err)
 	}
+
+
 	// If this is a large batch, we need to clear the batch contents as the
 	// flushable batch may still be present in the flushables queue.
 	//
@@ -754,14 +843,28 @@ func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
 	if batch.flushable != nil {
 		batch.data = nil
 	}
+
+
 	return nil
 }
 
+// 上一阶段已经准备好 Memtable ，在 apply 阶段便会将 batch 写入到 Memtable 中。
+//
+// commitAppy 方法中，
+//	(1) 首先会将 batch 写入 memtable，memtable 内部是无锁 Skiplist，支持并发读写；
+// 	(2) 写入完毕后释放 memtable 的写引用;
+//	(3) 最后调用 DB.maybeScheduleFlush 决定是否将 memtable flush 到磁盘，该方法是异步执行的，
+//		因此临界区耗时较短，flush 的流程我们放到后面剖析 compaction 的章节去讲。
+//
+// commitAppy 完毕后，数据就已经成功写入到 memtable 中，这时候写入流程还并未结束，数据还不能读取到。
+// 我们继续看下一阶段 publish。
 func (d *DB) commitApply(b *Batch, mem *memTable) error {
 	if b.flushable != nil {
 		// This is a large batch which was already added to the immutable queue.
 		return nil
 	}
+
+	// 写入 memTable ，无锁
 	err := mem.apply(b, b.SeqNum())
 	if err != nil {
 		return err
@@ -781,13 +884,48 @@ func (d *DB) commitApply(b *Batch, mem *memTable) error {
 		d.maybeScheduleFlush()
 		d.mu.Unlock()
 	}
+
 	return nil
 }
 
+
+
+// 这个方法里面会执行两个核心的操作：
+//	1. 准备 batch 的 Memtable；
+//	2. 如果开启了 Wal，将数据写入到日志的内存结构中。
+//
+// 我们来看看日志的格式：
+//	|-                  header                        -|-    body     -|
+//	+---------+-----------+-----------+----------------+---   ...   ---+
+//	|CRC (4B) | Size (2B) | Type (1B) | Log number (4B)|    Payload    |
+//	+---------+-----------+-----------+----------------+---   ...   ---+
+//
+// 日志由 header 和 body 构成。
+//
+// header 包含：
+// 	4 字节 CRC 校验码，
+// 	2 字节 Size 表示 body 的大小，
+// 	1 字节 Type 表示日志处在 block 中的位置，后面详细解释，
+//	4 字节 LogNum 表示日志文件的编号，可用于日志复用，这个后面章节再详解；
+//
+// body 包含：
+//	payload 表示日志的内容，在这里即为 Batch 的字节数组数据。
+//
+// 日志是按照 32KB 的 Block 来存放的，如下图所示：
+//
+// 如果一条日志比较小，足以放入到 1 个 Block 中，此时 Type 即为 full，
+// 如果一条日志比较大，那么 1 个 Block 无法放入，那么一条日志便会切分成多个片段跨多个 Block 存放，
+// 第一个片段的 Type 为 first，中间片段的 Type 为 middle，最后一个片段的 Type 为 last。
+// 读取日志时，便可根据 Type 将日志组装还原。
+//
+// 有了对日志格式的介绍，我们再看 SyncRecord 方法就比较容易了。
 func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*memTable, error) {
 	var size int64
+
+	// 获取 batch 的底层字节数组
 	repr := b.Repr()
 
+	//
 	if b.flushable != nil {
 		// We have a large batch. Such batches are special in that they don't get
 		// added to the memtable, and are instead inserted into the queue of
@@ -801,6 +939,7 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		b.flushable.setSeqNum(b.SeqNum())
 		if !d.opts.DisableWAL {
 			var err error
+			//
 			size, err = d.mu.log.SyncRecord(repr, syncWG, syncErr)
 			if err != nil {
 				panic(err)
@@ -808,11 +947,13 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		}
 	}
 
+	// 上锁，操作 memtable
 	d.mu.Lock()
 
 	// Switch out the memtable if there was not enough room to store the batch.
+	//
+	// 确保当前 Memtable 是否足以容纳 batch 的数据
 	err := d.makeRoomForWrite(b)
-
 	if err == nil && !d.opts.DisableWAL {
 		d.mu.log.bytesIn += uint64(len(repr))
 	}
@@ -828,16 +969,19 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		return nil, err
 	}
 
+	// 如果 wal 未开启，直接返回 memtable
 	if d.opts.DisableWAL {
 		return mem, nil
 	}
 
+	// 将数据写入 wal 内存结构
 	if b.flushable == nil {
 		size, err = d.mu.log.SyncRecord(repr, syncWG, syncErr)
 		if err != nil {
 			panic(err)
 		}
 	}
+
 
 	atomic.StoreUint64(&d.atomic.logSize, uint64(size))
 	return mem, err
@@ -861,9 +1005,11 @@ var iterAllocPool = sync.Pool{
 // newIterInternal constructs a new iterator, merging in batch iterators as an extra
 // level.
 func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterator {
+
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
+
 	if o.rangeKeys() {
 		if d.opts.Experimental.RangeKeys == nil {
 			panic("pebble: range keys require the Experimental.RangeKeys option")
@@ -875,9 +1021,11 @@ func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterato
 			))
 		}
 	}
+
 	if o != nil && o.RangeKeyMasking.Suffix != nil && o.KeyTypes != IterKeyTypePointsAndRanges {
 		panic("pebble: range key masking requires IterKeyTypePointsAndRanges")
 	}
+
 	if (batch != nil || s != nil) && (o != nil && o.OnlyReadGuaranteedDurable) {
 		// We could add support for OnlyReadGuaranteedDurable on snapshots if
 		// there was a need: this would require checking that the sequence number
@@ -885,6 +1033,7 @@ func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterato
 		// DB.mem.queue[0].logSeqNum.
 		panic("OnlyReadGuaranteedDurable is not supported for batches or snapshots")
 	}
+
 	// Grab and reference the current readState. This prevents the underlying
 	// files in the associated version from being deleted if there is a current
 	// compaction. The readState is unref'd by Iterator.Close().
@@ -924,9 +1073,11 @@ func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterato
 			rangeKeyIter: d.newRangeKeyIter(seqNum, batch, readState, o),
 		}
 	}
+
 	if o != nil {
 		dbi.opts = *o
 	}
+
 	dbi.opts.logger = d.opts.Logger
 	return finishInitializingIter(buf)
 }
@@ -977,9 +1128,11 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 	}
 
 	if dbi.opts.pointKeys() {
+
 		if numMergingLevels > cap(mlevels) {
 			mlevels = make([]mergingIterLevel, 0, numMergingLevels)
 		}
+
 		if numLevelIters > cap(levels) {
 			levels = make([]levelIter, 0, numLevelIters)
 		}
@@ -1015,12 +1168,28 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 		addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
 			li := &levels[levelsIndex]
 
-			li.init(dbi.opts, dbi.cmp, dbi.split, dbi.newIters, files, level, nil)
+			li.init(
+				dbi.opts,
+				dbi.cmp,
+				dbi.split,
+				dbi.newIters,
+				files,
+				level,
+				nil,
+			)
+
 			li.initRangeDel(&mlevels[mlevelsIndex].rangeDelIter)
-			li.initSmallestLargestUserKey(&mlevels[mlevelsIndex].smallestUserKey,
+
+			li.initSmallestLargestUserKey(
+				&mlevels[mlevelsIndex].smallestUserKey,
 				&mlevels[mlevelsIndex].largestUserKey,
-				&mlevels[mlevelsIndex].isLargestUserKeyRangeDelSentinel)
-			li.initIsSyntheticIterBoundsKey(&mlevels[mlevelsIndex].isSyntheticIterBoundsKey)
+				&mlevels[mlevelsIndex].isLargestUserKeyRangeDelSentinel,
+			)
+
+			li.initIsSyntheticIterBoundsKey(
+				&mlevels[mlevelsIndex].isSyntheticIterBoundsKey,
+			)
+
 			mlevels[mlevelsIndex].iter = li
 
 			levelsIndex++
@@ -1052,9 +1221,18 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 	// an interleaving iterator. The dbi.rangeKeysIter is an iterator into
 	// fragmented range keys read from the global range key arena.
 	if dbi.rangeKey != nil {
-		dbi.rangeKey.iter.Init(dbi.cmp, dbi.split, &buf.merging, dbi.rangeKey.rangeKeyIter, dbi.opts.RangeKeyMasking.Suffix)
+		dbi.rangeKey.iter.Init(
+			dbi.cmp,
+			dbi.split,
+			&buf.merging,
+			dbi.rangeKey.rangeKeyIter,
+			dbi.opts.RangeKeyMasking.Suffix,
+		)
 		dbi.iter = &dbi.rangeKey.iter
-		dbi.iter.SetBounds(dbi.opts.LowerBound, dbi.opts.UpperBound)
+		dbi.iter.SetBounds(
+			dbi.opts.LowerBound,
+			dbi.opts.UpperBound,
+		)
 	}
 	return dbi
 }
@@ -1598,14 +1776,53 @@ func (d *DB) newFlushableEntry(f flushable, logNum FileNum, logSeqNum uint64) *f
 //
 // Both DB.mu and commitPipeline.mu must be held by the caller. Note that DB.mu
 // may be released and reacquired.
+//
+//
+// 确保当前 Memtable 是否足以容纳 batch 的数据，如果当前 Memtable 容量已经满了，
+// 会将其转变为 Immutable 并重新创建 Memtable。
+//
+// 由于 makeRoomForWrite 会对 memtable 和 log 进行操作，因此这里会加锁，该方法执行逻辑比较复杂，
+//
+//
+// 主要逻辑:
+// 	当前 memtable 空间足够，直接写入
+//	当前 memtable 空间不够，将当前 memtable 切换为 immutable memtable，然后将当前 memtable 刷盘
+//	batch 为空或者为 large batch 则直接切换当前 memtable（注：这两种视为非常规 batch）
+//	如果切换 memtable 则同时会生成新的 log 文件
+//
+//
+// 可以看到，这里有两种情况会强制切换 memtable，一种是 batch 为空，代表手动 flush，另一种是 batch 为 large batch。
+// 下面循环中，
+//	首先检查当前 memtable 是否正在切换中，如果是则等待当前 memtable 切换完毕；
+//
+//	随后判断当前 batch 是否为常规 batch，如果为常规 batch ，则调用 memtable 的 prepare 函数判断当前 batch 空间是否足够，
+//	如果足够则直接返回，否则返回 ErrArenaFull，代表空间已满；
+//
+//	下面进入切换 memtable 的逻辑，到这里可以看出，有三种情况会切换 memtable：
+//		1. 手动 flush，
+//		2. Large batch
+//		3. 当前 memtable 已满；
+//
+//	接下来会计算当前内存所有 memtable 的空间大小，如果总大小超过停写阈值，则会阻塞写，等待 compact 完成；
+//
+//	再接下来会判断 L0 的读放大是否超过阈值，如果超过则阻塞写，等待 compact 完成；
+//
+//	如果是 large batch，则会生成 flushableEntry，然后添加到 immutable queue 中；
+//
+//	最后会将当前 memtable 切换为 immutable 并加入到 queue 中。
+//
+//	最后将 immutable 解引用，并调用 maybeScheduleFlush 触发写入操作。
 func (d *DB) makeRoomForWrite(b *Batch) error {
 	force := b == nil || b.flushable != nil
 	stalled := false
 	for {
+		// 检查当前 memtable 是否正在切换中
 		if d.mu.mem.switching {
 			d.mu.mem.cond.Wait()
 			continue
 		}
+
+		// batch 为正常小数据量时，进入 prepare
 		if b != nil && b.flushable == nil {
 			err := d.mu.mem.mutable.prepare(b)
 			if err != arenaskl.ErrArenaFull {
@@ -1620,12 +1837,18 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			}
 			return nil
 		}
+
+
 		// force || err == ErrArenaFull, so we need to rotate the current memtable.
 		{
+
 			var size uint64
+			// 计算所有 memtable 大小
 			for i := range d.mu.mem.queue {
 				size += d.mu.mem.queue[i].totalBytes()
 			}
+
+			// 总大小超过阈值，需要阻塞写，等待 compact 完成
 			if size >= uint64(d.opts.MemTableStopWritesThreshold)*uint64(d.opts.MemTableSize) {
 				// We have filled up the current memtable, but already queued memtables
 				// are still flushing, so we wait.
@@ -1639,7 +1862,10 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				continue
 			}
 		}
+
 		l0ReadAmp := d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
+
+		// l0 读放大超过阈值需要阻塞等待
 		if l0ReadAmp >= d.opts.L0StopWritesThreshold {
 			// There are too many level-0 files, so we wait.
 			if !stalled {

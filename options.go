@@ -318,10 +318,25 @@ func (o *LevelOptions) EnsureDefaults() *LevelOptions {
 	return o
 }
 
+
+
+// BytesPerSync 								// 控制 sstable 按照该值平滑刷盘，防止系统一次性刷大量脏页导致写入延时抖动，默认值是 512KB
+// WALBytesPerSync 							// 控制 wal 按照该值平滑刷盘，不过 Pebble 认为该值一般情况下没必要设置，因为大部分场景 wal 是 sync 写入的，默认值是 0
+// DisableWAL 									// 是否关闭 Wal，该参数为 true 时，不写 Wal，数据可靠性最低，默认为 false
+// L0CompactionThreshold 				// level 0 读放大 compaction 阈值，到达阈值后将触发 L0 compaction，默认值是 4
+// L0StopWritesThreshold 				// level 0 的读放大停写阈值，达到阈值后将阻塞写，默认值是 12
+// LBaseMaxBytes 								// level 0 compaction 至的 level 最大容量，其他层的最大容量会根据该值动态计算，默认是 64 MB
+// MemTableSize  								// memtable 的最大值，memtable 的大小从  256KB 开始分配，每次新建则翻倍直到达到该阈值，默认是 4MB
+// MemTableStopWritesThreshold 	// 所有 memtable 总大小达到  MemTableStopWritesThreshold*MemTableSize 会阻塞写，默认值是 2
+// MaxConcurrentCompactions 		// 最大 compaction 并发数，默认值是 1，具体用处等到后面将 compaction 时再详细展开
+// ReadOnly 										// DB 以只读方式打开，后台的 compaction 和 flush 会关闭
+
+
 // Options holds the optional parameters for configuring pebble. These options
 // apply to the DB at large; per-query options are defined by the IterOptions
 // and WriteOptions types.
 type Options struct {
+
 	// Sync sstables periodically in order to smooth out writes to disk. This
 	// option does not provide any persistency guarantee, but is used to avoid
 	// latency spikes if the OS automatically decides to write out a large chunk
