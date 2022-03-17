@@ -115,7 +115,7 @@ func (q *syncQueue) push(wg *sync.WaitGroup, err *error) {
 	// 根据 head 定位到 slot ，将数据保存到该 slot
 	slot := &q.slots[head&uint32(len(q.slots)-1)]
 	slot.wg = wg
-	slot.err = err
+	slot.err = err	// 用于将错误传出去
 
 	// Increment head.
 	// This passes ownership of slot to dequeue and acts as a store barrier for writing the slot.
@@ -141,31 +141,44 @@ func (q *syncQueue) load() (head, tail uint32) {
 	if atomic.LoadUint32(&q.blocked) == 1 {
 		return 0, 0
 	}
-
 	ptrs := atomic.LoadUint64(&q.headTail)
 	head, tail = q.unpack(ptrs)
 	return head, tail
 }
 
 func (q *syncQueue) pop(head, tail uint32, err error) error {
+	// Queue is empty.
 	if tail == head {
-		// Queue is empty.
 		return nil
 	}
 
+	// 遍历 slots[head, tail] ，逐个调用 slot.wg.Done() 以通知 waiters 。
 	for ; tail != head; tail++ {
+
+		// 取当前 slot
 		slot := &q.slots[tail&uint32(len(q.slots)-1)]
+
+		// 取当前 wg
 		wg := slot.wg
 		if wg == nil {
 			return errors.Errorf("nil waiter at %d", errors.Safe(tail&uint32(len(q.slots)-1)))
 		}
+
+		// 保存错误(通过指针将错误赋值给 waiter)
 		*slot.err = err
+
+		// 重置变量
 		slot.wg = nil
 		slot.err = nil
+
 		// We need to bump the tail count before signalling the wait group as
 		// signalling the wait group can trigger release a blocked goroutine which
 		// will try to enqueue before we've "freed" space in the queue.
+		//
+		// 移动指针
 		atomic.AddUint64(&q.headTail, 1)
+
+		// 通知 waiter
 		wg.Done()
 	}
 
@@ -322,6 +335,7 @@ type LogWriter struct {
 	// 当前块
 	block *block
 
+	// 空闲 blocks 列表，避免重复分配 block 带来开销，初始化指定了最多 16 个 block 可用，超过则需等待。
 	free struct {
 		sync.Mutex
 
@@ -374,9 +388,12 @@ type LogWriter struct {
 
 // NewLogWriter returns a new LogWriter.
 func NewLogWriter(w io.Writer, logNum base.FileNum) *LogWriter {
-	c, _ := w.(io.Closer)
-	s, _ := w.(syncer)
 
+	// 底层存储对象
+	c, _ := w.(io.Closer)	// 要求 w 实现 close 接口
+	s, _ := w.(syncer)		// 要求 w 实现 sync 接口
+
+	//
 	r := &LogWriter{
 		w: w,
 		c: c,
@@ -391,10 +408,10 @@ func NewLogWriter(w io.Writer, logNum base.FileNum) *LogWriter {
 		},
 	}
 
-	r.free.cond.L = &r.free.Mutex
-	r.free.blocks = make([]*block, 0, 16)
-	r.free.allocated = 1
-	r.block = &block{}
+	r.free.cond.L = &r.free.Mutex					// 初始化 sync.Cond && sync.Mutex
+	r.free.blocks = make([]*block, 0, 16)	// 指定最多 16 个空闲 block 可用，超过则需等待。
+	r.free.allocated = 1									// 已创建的 block 总数
+	r.block = &block{}										// 当前 block
 
 	r.flusher.ready.init(&r.flusher.Mutex, &r.flusher.syncQ)
 	r.flusher.closed = make(chan struct{})
@@ -584,7 +601,6 @@ func (w *LogWriter) flushLoop(context.Context) {
 		// 这样，即使我们还没有准备好同步，也可以进行 sync 。
 		head, tail := f.syncQ.load()
 
-
 		// Grab the portion of the current block that requires flushing. Note that
 		// the current block can be added to the pending blocks list after we
 		// release the flusher lock, but it won't be part of pending. This has to
@@ -625,13 +641,18 @@ func (w *LogWriter) flushLoop(context.Context) {
 			continue
 		}
 
-		//
+		// 如果此次 flush 触发了 sync ，那么距离下次 flush 至少要经过 min 时间。
 		if synced && f.minSyncInterval != nil {
+
 			// A sync was performed.
 			// Make sure we've waited for the min sync interval before syncing again.
 			if min := f.minSyncInterval(); min > 0 {
-				//
+
+				// 阻塞新的 sync 请求
 				f.syncQ.setBlocked()
+
+				// 创建 sync 定时器
+
 				// 为空则初始化
 				if syncTimer == nil {
 					// 在 min 之后触发 func()
@@ -652,6 +673,8 @@ func (w *LogWriter) flushPending(
 	data []byte, pending []*block, head, tail uint32,
 ) (synced bool, err error) {
 
+
+
 	defer func() {
 		// Translate panics into errors. The errors will cause flushLoop to shut
 		// down, but allows us to do so in a controlled way and avoid swallowing
@@ -670,16 +693,19 @@ func (w *LogWriter) flushPending(
 		}
 	}
 
-	// 把当前 block 中的 data flush 到存储
+	// 把当前 block 中的 data flush 到底层存储
 	if err == nil && len(data) > 0 {
 		_, err = w.w.Write(data)
 	}
 
+	// 是否需要 sync ，如果存在 waiters 就需要 sync 。
 	synced = head != tail
 	if synced {
+		// 执行 sync
 		if err == nil && w.s != nil {
 			err = w.s.Sync()
 		}
+		// 通知 waiters
 		f := &w.flusher
 		if popErr := f.syncQ.pop(head, tail, err); popErr != nil {
 			return synced, popErr
@@ -690,7 +716,7 @@ func (w *LogWriter) flushPending(
 }
 
 func (w *LogWriter) flushBlock(b *block) error {
-	// 将 block 写入到 w
+	// 将 block 数据写入到 w 中
 	if _, err := w.w.Write(b.buf[b.flushed:]); err != nil {
 		return err
 	}
@@ -713,23 +739,38 @@ func (w *LogWriter) queueBlock() {
 
 	// Allocate a new block, blocking until one is available.
 	// We do this first because w.block is protected by w.flusher.Mutex.
-	//
-	// 获取空闲块
+
+
+	///// 1. 获取一个可用 block
+
+	// 加锁
 	w.free.Lock()
+
+	// 当前无可用 block
 	if len(w.free.blocks) == 0 {
+		// 总数未达到上限，则创建新的 block
 		if w.free.allocated < cap(w.free.blocks) {
 			w.free.allocated++
 			w.free.blocks = append(w.free.blocks, &block{})
+		// 总数已达到上限，则等待有空闲 block 可用
 		} else {
 			for len(w.free.blocks) == 0 {
 				w.free.cond.Wait()
 			}
 		}
 	}
+
+	// 取出最后的 block 并将其从 free list 中移除
 	nextBlock := w.free.blocks[len(w.free.blocks)-1]
 	w.free.blocks = w.free.blocks[:len(w.free.blocks)-1]
+
+	// 解锁
 	w.free.Unlock()
 
+
+	///// 2. 把当前 block 推入 pending 列表，
+	/////    并将刚刚取出的空闲 block 作为新的当前 block ，
+	/////    并通知后台 flush 协程将刚刚推入 pending 列表的 block 执行落盘。
 
 	f := &w.flusher
 	f.Lock()

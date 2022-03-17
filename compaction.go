@@ -1300,11 +1300,13 @@ func (d *DB) maybeScheduleDelayedFlush(tbl *memTable) {
 			break
 		}
 	}
+
 	if mem == nil || mem.flushForced || mem.delayedFlushForced {
 		return
 	}
 	mem.delayedFlushForced = true
 	go func() {
+
 		timer := time.NewTimer(d.opts.Experimental.DeleteRangeFlushDelay)
 		defer timer.Stop()
 

@@ -61,6 +61,17 @@ var memTableEmptySize = func() uint32 {
 // proceed concurrently.
 //
 // It is safe to call get, apply, newIter, and newRangeDelIter concurrently.
+//
+//
+//
+// memtable 实际上是一个预分配的固定内存大小的 skiplist，因此当 batch 超过 memtable 内存大小时，无法扩容。
+// 只能将 large batch 转变为 flushable 来处理，这样间接解决 memtable 内存无法容纳 large batch 的问题。
+//
+// 再一个原因是，如果当前 large batch 过大即使未超过 memtable 内存，将 large batch 写入 memtable，
+// 那么很快就会导致 memtable full，触发 flush，既然 large batch 很快便会触发 flush，
+// 那么不如直接将其转变为 flushable，这样也避免了 large batch 到 memtable 的拷贝开销。
+//
+//
 type memTable struct {
 	cmp         Compare
 	formatKey   base.FormatKey

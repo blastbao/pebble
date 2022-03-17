@@ -848,44 +848,51 @@ func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
 	return nil
 }
 
-// 上一阶段已经准备好 Memtable ，在 apply 阶段便会将 batch 写入到 Memtable 中。
+// 在 Prepare 阶段已经准备好空间足够的 MemTable ，在 Apply 阶段便会将 batch 写入到 MemTable 中。
 //
-// commitAppy 方法中，
-//	(1) 首先会将 batch 写入 memtable，memtable 内部是无锁 Skiplist，支持并发读写；
-// 	(2) 写入完毕后释放 memtable 的写引用;
-//	(3) 最后调用 DB.maybeScheduleFlush 决定是否将 memtable flush 到磁盘，该方法是异步执行的，
-//		因此临界区耗时较短，flush 的流程我们放到后面剖析 compaction 的章节去讲。
+// commitApply 方法中，
+//	(1) 首先通过 memTable.apply() 将 batch 写入 MemTable，MemTable 内部是无锁 SkipList，支持并发读写；
+//  (2) 如果 Batch 有 DeleteRange 且有配置 Experimental.DeleteRangeFlushDelay(CRDB 默认 10s) 则
+// 		  schedule 一个 DelayedFlush 来让 Delete Range 的空间即便一段时间没有写入也能能被释放。
+// 	(3) 写入完毕后释放 MemTable 的写引用，减少引用计数并如果为 0, 尝试 schedule 一次 Flush;
+//	(4) 最后调用 DB.maybeScheduleFlush 决定是否将 MemTable flush 到磁盘，该方法是异步执行的，
+//		  因此临界区耗时较短，flush 的流程我们放到后面剖析 compaction 的章节去讲。
 //
-// commitAppy 完毕后，数据就已经成功写入到 memtable 中，这时候写入流程还并未结束，数据还不能读取到。
+// commitApply 完毕后，数据就已经成功写入到 MemTable 中，这时候写入流程还并未结束，数据还不能读取到。
 // 我们继续看下一阶段 publish。
+//
 func (d *DB) commitApply(b *Batch, mem *memTable) error {
-	if b.flushable != nil {
-		// This is a large batch which was already added to the immutable queue.
+
+	// 如果是 Large batch ，直接 return 。
+		if b.flushable != nil {
+			// This is a large batch which was already added to the immutable queue.
+			return nil
+		}
+
+		// 写入 memTable 中的 SkipList ，无锁
+		if err := mem.apply(b, b.SeqNum()); err != nil {
+			return err
+		}
+
+		// If the batch contains range tombstones and the database is configured
+		// to flush range deletions, schedule a delayed flush so that disk space
+		// may be reclaimed without additional writes or an explicit flush.
+		//
+		//
+		if b.countRangeDels > 0 && d.opts.Experimental.DeleteRangeFlushDelay > 0 {
+			d.mu.Lock()
+			d.maybeScheduleDelayedFlush(mem)
+			d.mu.Unlock()
+		}
+
+		// 减引用，若为 0 返回 true
+		if mem.writerUnref() {
+			d.mu.Lock()
+			d.maybeScheduleFlush()
+			d.mu.Unlock()
+		}
+
 		return nil
-	}
-
-	// 写入 memTable ，无锁
-	err := mem.apply(b, b.SeqNum())
-	if err != nil {
-		return err
-	}
-
-	// If the batch contains range tombstones and the database is configured
-	// to flush range deletions, schedule a delayed flush so that disk space
-	// may be reclaimed without additional writes or an explicit flush.
-	if b.countRangeDels > 0 && d.opts.Experimental.DeleteRangeFlushDelay > 0 {
-		d.mu.Lock()
-		d.maybeScheduleDelayedFlush(mem)
-		d.mu.Unlock()
-	}
-
-	if mem.writerUnref() {
-		d.mu.Lock()
-		d.maybeScheduleFlush()
-		d.mu.Unlock()
-	}
-
-	return nil
 }
 
 
@@ -952,7 +959,7 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 
 	// Switch out the memtable if there was not enough room to store the batch.
 	//
-	// 确保当前 Memtable 是否足以容纳 batch 的数据
+	// 确保当前 MemTable 是否足以容纳 batch 的数据
 	err := d.makeRoomForWrite(b)
 	if err == nil && !d.opts.DisableWAL {
 		d.mu.log.bytesIn += uint64(len(repr))
@@ -982,7 +989,7 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		}
 	}
 
-
+	// 更新日志总大小
 	atomic.StoreUint64(&d.atomic.logSize, uint64(size))
 	return mem, err
 }
@@ -1505,13 +1512,15 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
 
 	d.commit.mu.Lock()
 	defer d.commit.mu.Unlock()
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
 	flushed := d.mu.mem.queue[len(d.mu.mem.queue)-1].flushed
-	err := d.makeRoomForWrite(nil)
-	if err != nil {
+	if err := d.makeRoomForWrite(nil); err != nil {
 		return nil, err
 	}
+
 	return flushed, nil
 }
 
@@ -1816,7 +1825,8 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 	force := b == nil || b.flushable != nil
 	stalled := false
 	for {
-		// 检查当前 memtable 是否正在切换中
+
+		// 检查当前 memTable 是否正在切换中
 		if d.mu.mem.switching {
 			d.mu.mem.cond.Wait()
 			continue
@@ -1843,7 +1853,8 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 		{
 
 			var size uint64
-			// 计算所有 memtable 大小
+
+			// 计算所有 memTable 大小
 			for i := range d.mu.mem.queue {
 				size += d.mu.mem.queue[i].totalBytes()
 			}

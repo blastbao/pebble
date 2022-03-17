@@ -135,7 +135,6 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		write:         d.commitWrite,
 	})
 
-
 	// 压缩 compaction 频控
 	d.compactionLimiter = rate.NewLimiter(
 		rate.Limit(d.opts.private.minCompactionRate),
@@ -366,8 +365,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	var ve versionEdit
 	for i, lf := range logFiles {
 		lastWAL := i == len(logFiles)-1
-		maxSeqNum, err := d.replayWAL(jobID, &ve, opts.FS,
-			opts.FS.PathJoin(d.walDirname, lf.name), lf.num, strictWALTail && !lastWAL)
+		maxSeqNum, err := d.replayWAL(jobID, &ve, opts.FS, opts.FS.PathJoin(d.walDirname, lf.name), lf.num, strictWALTail && !lastWAL)
 		if err != nil {
 			return nil, err
 		}
@@ -377,6 +375,8 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		}
 	}
 	d.mu.versions.atomic.visibleSeqNum = d.mu.versions.atomic.logSeqNum
+
+
 
 	if !d.opts.ReadOnly {
 		// Create an empty .log file.
@@ -407,11 +407,13 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		if err := d.walDir.Sync(); err != nil {
 			return nil, err
 		}
+
 		d.opts.EventListener.WALCreated(WALCreateInfo{
 			JobID:   jobID,
 			Path:    newLogName,
 			FileNum: newLogNum,
 		})
+
 		// This isn't strictly necessary as we don't use the log number for
 		// memtables being flushed, only for the next unflushed memtable.
 		d.mu.mem.queue[len(d.mu.mem.queue)-1].logNum = newLogNum
@@ -573,6 +575,7 @@ func GetVersion(dir string, fs vfs.FS) (string, error) {
 func (d *DB) replayWAL(
 	jobID int, ve *versionEdit, fs vfs.FS, filename string, logNum FileNum, strictWALTail bool,
 ) (maxSeqNum uint64, err error) {
+
 	file, err := fs.Open(filename)
 	if err != nil {
 		return 0, err
@@ -590,9 +593,9 @@ func (d *DB) replayWAL(
 		lastFlushOffset int64
 	)
 
+	// 只读模式
 	if d.opts.ReadOnly {
-		// In read-only mode, we replay directly into the mutable memtable which will
-		// never be flushed.
+		// In read-only mode, we replay directly into the mutable memtable which will never be flushed.
 		mem = d.mu.mem.mutable
 		if mem != nil {
 			entry = d.mu.mem.queue[len(d.mu.mem.queue)-1]
@@ -617,6 +620,7 @@ func (d *DB) replayWAL(
 		}
 		mem, entry = nil, nil
 	}
+
 	// Creates a new memtable if there is no current memtable.
 	ensureMem := func(seqNum uint64) {
 		if mem != nil {
@@ -628,12 +632,17 @@ func (d *DB) replayWAL(
 			d.mu.mem.queue = append(d.mu.mem.queue, entry)
 		}
 	}
+
+
+
 	for {
 		offset = rr.Offset()
+
 		r, err := rr.Next()
 		if err == nil {
 			_, err = io.Copy(&buf, r)
 		}
+
 		if err != nil {
 			// It is common to encounter a zeroed or invalid chunk due to WAL
 			// preallocation and WAL recycling. We need to distinguish these
@@ -699,19 +708,23 @@ func (d *DB) replayWAL(
 		buf.Reset()
 	}
 	flushMem()
+
 	// mem is nil here.
 	if !d.opts.ReadOnly {
-		c := newFlush(d.opts, d.mu.versions.currentVersion(),
-			1 /* base level */, toFlush, &d.atomic.bytesFlushed)
+
+		c := newFlush(d.opts, d.mu.versions.currentVersion(), 1 /* base level */, toFlush, &d.atomic.bytesFlushed)
+
 		newVE, _, err := d.runCompaction(jobID, c, nilPacer)
 		if err != nil {
 			return 0, err
 		}
+
 		ve.NewFiles = append(ve.NewFiles, newVE.NewFiles...)
 		for i := range toFlush {
 			toFlush[i].readerUnref()
 		}
 	}
+
 	return maxSeqNum, err
 }
 
@@ -760,6 +773,7 @@ func Peek(dirname string, fs vfs.FS) (*DBDesc, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	// TODO(jackson): Immediately closing the marker is clunky. Add a
 	// PeekMarker variant that avoids opening the directory.
 	if err := manifestMarker.Close(); err != nil {

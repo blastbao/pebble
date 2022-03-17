@@ -120,15 +120,20 @@ func (q *commitQueue) dequeue() *Batch {
 // construction of an entire DB.
 //
 type commitEnv struct {
-	// The next sequence number to give to a batch. Protected by
-	// commitPipeline.mu.
+	// The next sequence number to give to a batch. Protected by commitPipeline.mu.
+	//
+	// 日志序号
 	logSeqNum *uint64
 
 	// The visible sequence number at which reads should be performed. Ratcheted
 	// upwards atomically as batches are applied to the memtable.
+	//
+	// 可见日志序号
 	visibleSeqNum *uint64
 
 	// Apply the batch to the specified memtable. Called concurrently.
+	//
+	// 将 batch 应用到 MemTable ，并发调用。
 	apply func(b *Batch, mem *memTable) error
 
 	// Write the batch to the WAL. If wg != nil, the data will be persisted
@@ -136,6 +141,8 @@ type commitEnv struct {
 	// and err != nil, a failure to persist the WAL will populate *err. Returns
 	// the memtable the batch should be applied to. Serial execution enforced by
 	// commitPipeline.mu.
+	//
+	// 将 batch 写入 WAL 并返回 MemTable
 	write func(b *Batch, wg *sync.WaitGroup, err *error) (*memTable, error)
 }
 
@@ -209,6 +216,63 @@ type commitEnv struct {
 // we hit an unapplied batch at the head of the queue we can block as we know
 // that committing of that unapplied batch will eventually find our (applied)
 // batch in the queue. See commitPipeline.publish for additional commentary.
+//
+//
+///
+//
+//	提交管道用于管理一系列原子提交变更（在单批中包含）到DB的阶段。
+//
+//	主要包括
+//		将批写入到WAL，并且可选是否将WAL刷新到磁盘。
+//		将变更应用到memtable。
+//	这两个步骤在期望高性能的场景下变得很复杂。
+//	在没有并发的情况下，性能被限制为一批数据写入（刷新）到WAL以及添加到memtable中的速度，
+//	这两个点都在提交管道的范围之外。
+//
+//	提交管道主要关注并发场景的性能，同时还要维护下面的两个不变性：
+//		所有batch需要以序列号的顺序写出到WAL。
+//		所有batch需要以序列号的顺序对读操作可见。
+//	这种不变性源于使用单个序列号来指示哪些变更是可见的。
+//	考虑这两种不变性，让我们重新考虑提交管道需要做的工作。
+//	将批量操作以串行化的方式写入WAL是必须的，因为只有一个WAL对象。
+//	注意，写WAL非常快，通常都是内存拷贝。
+//	将批量变更应用到内存表可以并发处理，因为底层跳跃表支持并发插入。
+//	发布可见序列是另一个串行化点，但是有一个变化：可见序列号不能被碰撞，
+//	直到早期批次的变更已经完成应用于内存表（可见序列号只是棘轮）。
+//
+//	最后，如果发出请求，则提交等待WAL同步。
+//	请注意，在棘轮显示可见序列号后等待WAL同步，允许另一个goroutine在WAL同步之前读取已提交的数据。
+//	这与RocksDB的手动WAL刷新功能类似。
+//	如有必要，应用程序代码需要对此进行保护。
+//
+// 提交管道操作的完整操作如下：
+// 	加锁：
+//    分配批操作序列号
+//    将批写到WAL
+//	将批刷新到WAL同步列表中（可选）
+//	将批操作应用到memtable中（并发地）
+//	等待更早的批应用完成
+//	棘轮读序列号
+//	等待WAL刷新（可选）
+//
+// 	一旦批处理被写入WAL，就会释放提交管道的互斥锁，允许另一个批处理写入WAL。
+// 	每个提交操作单独将其批处理应用于提供并发的内存表。
+//	WAL同步与应用内存表同时发生（请参阅commitPipeline.syncLoop）。
+//
+//	“等待早期批次应用”的工作比预期要复杂得多。
+//	显而易见的方法是保留待处理批次的队列，并为每个批次等待上一批次完成提交。
+//	这种方法最初尝试过，结果太慢了。
+//	问题在于它会导致过多的Go例程活动，因为每个提交的Go例程都需要唤醒，以便下一个Go例程被解除阻塞。
+//	当前代码中采用的方法在概念上是相似的，但它避免唤醒Go例程来执行另一个Go例程可以执行的工作。
+//
+//	commitQueue（单生产者，多消费者队列）包含提交批次的有序列表。
+//	在保存commitPipeline.mutex的同时完成对队列的添加，确保队列中批次的顺序与WAL中的排序相同。
+//	当批处理完成对内存表的应用时，它会自动更新其Batch.applied字段。
+//	通过commitPipeline.publish完成可见序列号的棘轮操作，该循环使“应用”批次出队列并使棘轮显示可见序列号。
+//	如果我们在队列的头部遇到未应用的批处理，我们可以阻塞，因为我们知道提交该未应用的批处理最终将在队列中找到我们的（应用的）批。
+//
+//	请参阅commitPipeline.publish以获取其他评论。
+
 type commitPipeline struct {
 	// WARNING: The following struct `commitQueue` contains fields which will
 	// be accessed atomically.
@@ -218,6 +282,11 @@ type commitPipeline struct {
 	// of the commitPipeline struct.
 	// For more information, see https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 	// Queue of pending batches to commit.
+	//
+	// pending 类型是 commitQueue，他是一个固定大小 lock-free 的队列实现,
+	// 可以固定大小是因 sem 已经限制了最大并发(queue 实现中有 head tail index 共用一个 uint64 等技巧)，
+	// pending 这里主要用用于对到达的写入 Batch 进行排序，而 seqNum 因为和 enqueue 是在持有锁的同时进行的，
+	// 所以可以保证 seq 和入队列顺序一致, 而后面 Publish 部分将依赖 pending 和 seq 来帮助确定能否 Publish.
 	pending commitQueue
 	env     commitEnv
 	sem     chan struct{}
@@ -264,11 +333,12 @@ func newCommitPipeline(env commitEnv) *commitPipeline {
 //
 // 到这里，Pipeline 的设计思想就分析完成了。
 func (p *commitPipeline) Commit(b *Batch, syncWAL bool) error {
+	// 参数检查
 	if b.Empty() {
 		return nil
 	}
 
-	// 并发控制，sem 是缓冲 channel，因此可以并发 commit 。
+	// 并发度控制
 	p.sem <- struct{}{}
 
 	// Prepare the batch for committing: enqueuing the batch in the pending
@@ -280,7 +350,7 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool) error {
 	//
 	//
 	// prepare 主要做的事情：
-	//	1. 准备好可用的 memtable
+	//	1. 准备好可用的 memTable
 	//	2. 写 wal(可以是异步的，将 wal 塞入 queue, 再异步写，提高并发性能)
 	//
 	// prepare 中会对 pipeline 加锁，因此整个过程是串行执行，不过该函数通常很快。
@@ -290,16 +360,17 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool) error {
 		return err
 	}
 
-
-	// Apply the batch to the memtable.
+	// Apply the batch to the memTable.
 	//
-	// 将 batch 写入 memtable ，这里可以是并发执行，该流程是 pipeline 中最耗的
+	// 将 batch 写入 memTable ，这里可以是并发执行，该流程是 pipeline 中最耗的
 	if err := p.env.apply(b, mem); err != nil {
 		b.db = nil // prevent batch reuse on error
 		return err
 	}
 
 	// Publish the batch sequence number.
+	//
+	// 将 batch 的 SeqNum 发布出去使其可见，换句话说，就是让提交的数据可读
 	p.publish(b)
 
 	<-p.sem
@@ -323,10 +394,12 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool) error {
 //
 //
 func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(seqNum uint64)) {
+
 	// This method is similar to Commit and prepare. Be careful about trying to
 	// share additional code with those methods because Commit and prepare are
 	// performance critical code paths.
 
+	//
 	b := newBatch(nil)
 	defer b.release()
 
@@ -336,45 +409,66 @@ func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(se
 	b.setCount(uint32(count))
 	b.commit.Add(1)
 
+	// 并发度控制
 	p.sem <- struct{}{}
 
+	// 加锁
 	p.mu.Lock()
 
 	// Enqueue the batch in the pending queue. Note that while the pending queue
 	// is lock-free, we want the order of batches to be the same as the sequence
 	// number order.
+	//
+	// 将 batch 入队
 	p.pending.enqueue(b)
 
 	// Assign the batch a sequence number. Note that we use atomic operations
 	// here to handle concurrent reads of logSeqNum. commitPipeline.mu provides
 	// mutual exclusion for other goroutines writing to logSeqNum.
+	//
+	// 给 Batch 分配一个序列号。
+	// 注意，我们在这里使用原子操作来处理 logSeqNum 的并发读取。
+	// commitPipeline.mu 提供了为其他写入 logSeqNum 的 goroutine 提供相互排斥。
+
+	// 获取日志序号
 	logSeqNum := atomic.AddUint64(p.env.logSeqNum, uint64(count)) - uint64(count)
 	seqNum := logSeqNum
 	if seqNum == 0 {
 		// We can't use the value 0 for the global seqnum during ingestion, because
 		// 0 indicates no global seqnum. So allocate one more seqnum.
+		//
+		// 不能使用 0 作为序号
 		atomic.AddUint64(p.env.logSeqNum, 1)
 		seqNum++
 	}
+
+	// 设置 Batch 的日志序号
 	b.setSeqNum(seqNum)
 
 	// Wait for any outstanding writes to the memtable to complete. This is
 	// necessary for ingestion so that the check for memtable overlap can see any
 	// writes that were sequenced before the ingestion. The spin loop is
 	// unfortunate, but obviates the need for additional synchronization.
+	//
 	for {
+		// 获取当前可见的序号
 		visibleSeqNum := atomic.LoadUint64(p.env.visibleSeqNum)
+		// 如果可见序号
 		if visibleSeqNum == logSeqNum {
 			break
 		}
+		// 让出运行权
 		runtime.Gosched()
 	}
 
 	// Invoke the prepare callback. Note the lack of error reporting. Even if the
 	// callback internally fails, the sequence number needs to be published in
 	// order to allow the commit pipeline to proceed.
+	//
+	//
 	prepare()
 
+	// 解锁
 	p.mu.Unlock()
 
 	// Invoke the apply callback.
@@ -386,8 +480,7 @@ func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(se
 	<-p.sem
 }
 
-
-// prepare 方法主要是准备 batch 写入的 Memtable 及异步写 wal。
+// prepare 方法主要是准备 batch 写入的 MemTable 及异步写 wal。
 //
 // 首先会根据 Wal 是否为同步模式来决定 commit 的等待计数，初始计数为 1，
 // 是因为必须等待 batch 的发布（后面 publish 方法中会看到），
@@ -395,16 +488,21 @@ func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(se
 // 注意，这里只是计数，commit.Wait 会在 publish 中调用。
 //
 // 然后加锁进入临界区，在临界区内：
-//	先将 batch 入队列；
-// 	然后给 batch 分配递增的序列号，由于外面有上锁，因此在并发环境下，batch 在队列中的顺序和 SeqNum 的顺序关系一致，即先入队列的 SeqNum 越小；
-//	最后将数据写入 wal。
+//	将 batch enqueue 到 commitPipeline.pending；
+// 	为 batch 生成同 enqueue 顺序的 seqNum 递增序号，由于外面有上锁，因此在并发环境下，batch 在队列中的顺序和 SeqNum 的顺序关系一致，即先入队列的 SeqNum 越小；
+//	调用 db.commitWrite 发起 WAL 写入(可不等待完成)。
 //
 // 这里的 write 方法其实是 DB.commitWrite，我们来看下写入的逻辑。
+
 func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
+
 	n := uint64(b.Count())
 	if n == invalidBatchCount {
 		return nil, ErrInvalidBatch
 	}
+
+	// 因为 prepare 和 publish 是成对的，所以 wg 至少为 1 ；
+	// 如果开启了 sync 标记，则还要等待后台 flush 协程完成落盘，需额外 +1 。
 	count := 1
 	if syncWAL {
 		count++
@@ -450,7 +548,18 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
 	return mem, err
 }
 
-// 执行到 publish 方法，说明当前 batch b 已经被 apply 到 Memtable 中了，
+
+// 在 commitPipeline.publish 中将从 commitPipeline.pending 中按顺序 dequeue batch 并
+// 对 visibleSeqNum 进行更新来进行 publish， dequeue 出的 batch 可能是当前 batch 前置 batch 或
+// 当前 batch， batch 可能被自己 publish 也可能被其他人 publish，每个 batch 处理都尝试 dequeue 并
+// 处理前置 batch 直到自己，最后总会被某一个人处理，但当前 batch 的处理需通过 WaitGroup 等待 “被 Publish”
+// 且 “WAL Sync” 完成才会返回，从而保证队列中必须将前置的 Batch Publish 完成才能 Publish 后续 Batch。
+//
+// 最后 Publish 操作最终将通过 versionSet.atomic.visibleSeqNum 的修改来控制读取侧的的可见性。
+//
+//
+//
+// 执行到 publish 方法，说明当前 batch b 已经被 apply 到 MemTable 中了，
 // 这里先将其标记为 applied 状态，然后从队列取出队头 batch，注意：
 //	1. 取出的 batch 有可能是当前线程对应的 batch，也有可能是其他线程的 batch；
 //	2. 如果队头 batch 并未 apply，则其并不会出队列，同时返回 nil 。
@@ -472,6 +581,7 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
 //
 // 下一章将继续补充写入路径上对 large batch 的特殊处理，以及详细讲解 makeRoomForWrite 的执行逻辑。
 func (p *commitPipeline) publish(b *Batch) {
+
 	// Mark the batch as applied.
 	// 标记当前 batch 已经 apply
 	atomic.StoreUint32(&b.applied, 1)
@@ -491,9 +601,8 @@ func (p *commitPipeline) publish(b *Batch) {
 			// Wait for another goroutine to publish us. We might also be waiting for
 			// the WAL sync to finish.
 			//
-			// [关键]
-			//	1. 等待 SeqNum 被发布
-			//	2. 如果 wal 同步落盘等待 flusher 通知落盘
+			// 如果为 nil ，意味着 pending 中已无待 publish 的 batch ，所以当前 batch 已经被
+			// 其它线程取出并处理，这里等待当前 batch 被别的线程处理完毕通过 b.commit 通知过来。
 			b.commit.Wait()
 			break
 		}
@@ -502,7 +611,6 @@ func (p *commitPipeline) publish(b *Batch) {
 			panic("not reached")
 		}
 
-
 		// We're responsible for publishing the sequence number for batch t, but
 		// another concurrent goroutine might sneak in and publish the sequence
 		// number for a subsequent batch. That's ok as all we're guaranteeing is
@@ -510,19 +618,32 @@ func (p *commitPipeline) publish(b *Batch) {
 		//
 		// 通过循环 + cas 的方式更新当前可见的 SeqNum
 		for {
+
+			// 首先通过原子操作取出 visibleSeqNum
 			curSeqNum := atomic.LoadUint64(p.env.visibleSeqNum)
+
+			// 计算新的 SeqNum
 			newSeqNum := t.SeqNum() + uint64(t.Count())
+
+			// 如果新的 SeqNum < visibleSeqNum ，说明有排在 t 后面的 batch 已经被其他线程 publish 了，
+			// 那么 t 也就相当于 publish 了，直接退出循环，否则更新 visibleSeqNum。
 			if newSeqNum <= curSeqNum {
 				// t's sequence number has already been published.
 				break
 			}
+
+			// 更新 visibleSeqNum
 			if atomic.CompareAndSwapUint64(p.env.visibleSeqNum, curSeqNum, newSeqNum) {
 				// We successfully published t's sequence number.
 				break
 			}
+
 		}
 
+		// t 成功 publish 后调用 t.commit.Done() 将计数减一，并通知 waiter
 		t.commit.Done()
+
+		// 回到第一层循环继续消费 pending 队列
 	}
 }
 
@@ -536,6 +657,7 @@ func (p *commitPipeline) ratchetSeqNum(nextSeqNum uint64) {
 	if logSeqNum >= nextSeqNum {
 		return
 	}
+
 	count := nextSeqNum - logSeqNum
 	_ = atomic.AddUint64(p.env.logSeqNum, uint64(count)) - uint64(count)
 	atomic.StoreUint64(p.env.visibleSeqNum, nextSeqNum)

@@ -47,6 +47,8 @@ func (it *Iterator) Close() error {
 // entry and false otherwise. Note that SeekGE only checks the upper bound. It
 // is up to the caller to ensure that key is greater than or equal to the lower
 // bound.
+//
+// 查找大于或者等于 key 的 kv 值
 func (it *Iterator) SeekGE(key []byte) *base.InternalKey {
 	_, it.nd = it.seekForBaseSplice(key, it.list.abbreviatedKey(key))
 	if it.nd == it.list.tail {

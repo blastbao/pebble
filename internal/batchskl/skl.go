@@ -91,22 +91,33 @@ type links struct {
 }
 
 type node struct {
+	// 不可变字段，所以不需要对其加锁访问
+	//
 	// The offset of the start of the record in the storage.
 	offset uint32
 	// The offset of the start and end of the key in storage.
 	keyStart uint32
 	keyEnd   uint32
+
+
 	// A fixed 8-byte abbreviation of the key, used to avoid retrieval of the key
 	// during seek operations. The key retrieval can be expensive purely due to
 	// cache misses while the abbreviatedKey stored here will be in the same
 	// cache line as the key and the links making accessing and comparing against
 	// it almost free.
 	abbreviatedKey uint64
+
 	// Most nodes do not need to use the full height of the link tower, since the
 	// probability of each successive level decreases exponentially. Because
 	// these elements are never accessed, they do not need to be allocated.
 	// Therefore, when a node is allocated, its memory footprint is deliberately
 	// truncated to not include unneeded link elements.
+	//
+	// 每个节点都有 maxHeight 高度个链表，用于指向每层的下一个或者上一个节点，用于加速查找
+	// 大部分节点不需要塔的全部高度，因为每个连续层的概率指数下降。
+	// 因为这些元素永远不会被访问，不需要被分配。
+	// 因此，当在区域中分配节点时，其内存占用被截断，不包括不需要的塔元素。
+	// 所有元素的访问都应该使用 CAS 操作，而不需要锁定。
 	links [maxHeight]links
 }
 
@@ -116,6 +127,9 @@ type node struct {
 // Storage interface. Deletion is not supported. Instead, higher-level code is
 // expected to perform deletion via tombstones and needs to process those
 // tombstones appropriately during retrieval operations.
+//
+// 跳跃表是一个快速、并发的实现支持向前、向后遍历。
+// 键值一旦被加入到跳跃表中，就是不可变的，不支持删除。
 type Skiplist struct {
 	storage        *[]byte
 	cmp            base.Compare
@@ -271,6 +285,8 @@ func (s *Skiplist) Add(keyOffset uint32) error {
 // bound is not checked on {SeekGE,First} and upper bound is not check on
 // {SeekLT,Last}. The user is expected to perform that check. Note that it is
 // safe for an iterator to be copied by value.
+//
+// 迭代器
 func (s *Skiplist) NewIter(lower, upper []byte) Iterator {
 	return Iterator{list: s, lower: lower, upper: upper}
 }
