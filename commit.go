@@ -419,7 +419,7 @@ func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(se
 	// is lock-free, we want the order of batches to be the same as the sequence
 	// number order.
 	//
-	// 将 batch 入队
+	// 将 batch 入队，等待被 commit 。
 	p.pending.enqueue(b)
 
 	// Assign the batch a sequence number. Note that we use atomic operations
@@ -432,6 +432,7 @@ func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(se
 
 	// 获取日志序号
 	logSeqNum := atomic.AddUint64(p.env.logSeqNum, uint64(count)) - uint64(count)
+
 	seqNum := logSeqNum
 	if seqNum == 0 {
 		// We can't use the value 0 for the global seqnum during ingestion, because
@@ -493,7 +494,10 @@ func (p *commitPipeline) AllocateSeqNum(count int, prepare func(), apply func(se
 //	调用 db.commitWrite 发起 WAL 写入(可不等待完成)。
 //
 // 这里的 write 方法其实是 DB.commitWrite，我们来看下写入的逻辑。
-
+//
+//
+//
+//
 func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
 
 	n := uint64(b.Count())
@@ -539,7 +543,7 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
 
 	// Write the data to the WAL.
 	//
-	// 将数据写入 wal
+	// 将数据写入 wal 并返回 MemTable
 	mem, err := p.env.write(b, syncWG, syncErr)
 
 	// 解锁

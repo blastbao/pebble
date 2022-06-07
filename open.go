@@ -572,9 +572,20 @@ func GetVersion(dir string, fs vfs.FS) (string, error) {
 //
 // d.mu must be held when calling this, but the mutex may be dropped and
 // re-acquired during the course of this method.
+//
+//
+// 回放日志
 func (d *DB) replayWAL(
-	jobID int, ve *versionEdit, fs vfs.FS, filename string, logNum FileNum, strictWALTail bool,
-) (maxSeqNum uint64, err error) {
+	jobID int,
+	ve *versionEdit,
+	fs vfs.FS,
+	filename string,
+	logNum FileNum,
+	strictWALTail bool,
+) (
+	maxSeqNum uint64,
+	err error,
+) {
 
 	file, err := fs.Open(filename)
 	if err != nil {
@@ -633,8 +644,6 @@ func (d *DB) replayWAL(
 		}
 	}
 
-
-
 	for {
 		offset = rr.Offset()
 
@@ -658,17 +667,19 @@ func (d *DB) replayWAL(
 		}
 
 		if buf.Len() < batchHeaderLen {
-			return 0, base.CorruptionErrorf("pebble: corrupt log file %q (num %s)",
-				filename, errors.Safe(logNum))
+			return 0, base.CorruptionErrorf("pebble: corrupt log file %q (num %s)", filename, errors.Safe(logNum))
 		}
 
 		// Specify Batch.db so that Batch.SetRepr will compute Batch.memTableSize
 		// which is used below.
-		b = Batch{db: d}
+		b = Batch{
+			db: d,
+		}
 		b.SetRepr(buf.Bytes())
 		seqNum := b.SeqNum()
 		maxSeqNum = seqNum + uint64(b.Count())
 
+		//
 		if b.memTableSize >= uint64(d.largeBatchThreshold) {
 			flushMem()
 			// Make a copy of the data slice since it is currently owned by buf and will
@@ -712,7 +723,13 @@ func (d *DB) replayWAL(
 	// mem is nil here.
 	if !d.opts.ReadOnly {
 
-		c := newFlush(d.opts, d.mu.versions.currentVersion(), 1 /* base level */, toFlush, &d.atomic.bytesFlushed)
+		c := newFlush(
+			d.opts,
+			d.mu.versions.currentVersion(),
+			1 /* base level */,
+			toFlush,
+			&d.atomic.bytesFlushed,
+		)
 
 		newVE, _, err := d.runCompaction(jobID, c, nilPacer)
 		if err != nil {

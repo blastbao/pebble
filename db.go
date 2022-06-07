@@ -348,6 +348,7 @@ type DB struct {
 		versions *versionSet
 
 
+		//
 		log struct {
 			// The queue of logs, containing both flushed and unflushed logs. The
 			// flushed logs will be a prefix, the unflushed logs a suffix. The
@@ -981,7 +982,7 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		return mem, nil
 	}
 
-	// 将数据写入 wal 内存结构
+	// 将数据 repr 写入 wal 日志
 	if b.flushable == nil {
 		size, err = d.mu.log.SyncRecord(repr, syncWG, syncErr)
 		if err != nil {
