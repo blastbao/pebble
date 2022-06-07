@@ -2646,12 +2646,17 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		}
 	}()
 
+
+	// 遍历日志文件列表
 	var obsoleteLogs []fileInfo
 	for i := range d.mu.log.queue {
 		// NB: d.mu.versions.minUnflushedLogNum is the log number of the earliest
 		// log that has not had its contents flushed to an sstable. We can recycle
 		// the prefix of d.mu.log.queue with log numbers less than
 		// minUnflushedLogNum.
+		//
+		// 找到首个 >= d.mu.versions.minUnflushedLogNum 的 log ，它是尚未被 flush 的首个 log ，
+		// 其前面的所有 logs 都已落盘，需要移除。
 		if d.mu.log.queue[i].fileNum >= d.mu.versions.minUnflushedLogNum {
 			obsoleteLogs = d.mu.log.queue[:i]
 			d.mu.log.queue = d.mu.log.queue[i:]
@@ -2693,6 +2698,9 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 	d.mu.Unlock()
 	defer d.mu.Lock()
 
+
+
+
 	files := [4]struct {
 		fileType fileType
 		obsolete []fileInfo
@@ -2702,6 +2710,7 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		{fileTypeManifest, obsoleteManifests},
 		{fileTypeOptions, obsoleteOptions},
 	}
+
 	_, noRecycle := d.opts.Cleaner.(base.NeedsFileContents)
 	filesToDelete := make([]obsoleteFile, 0, len(files))
 	for _, f := range files {
@@ -2730,6 +2739,8 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 			})
 		}
 	}
+
+
 	if len(filesToDelete) > 0 {
 		d.deleters.Add(1)
 		// Delete asynchronously if that could get held up in the pacer.

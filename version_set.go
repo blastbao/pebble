@@ -94,6 +94,8 @@ type versionSet struct {
 
 	// minUnflushedLogNum is the smallest WAL log file number corresponding to
 	// mutations that have not been flushed to an sstable.
+	//
+	// minUnflushedLogNum 是最小的 WAL 日志文件编号，对应于未被刷入 sstable 的变更。
 	minUnflushedLogNum FileNum
 
 	// The next file number. A single counter is used to assign file numbers

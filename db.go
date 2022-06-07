@@ -347,18 +347,22 @@ type DB struct {
 		// version set are aligned properly.
 		versions *versionSet
 
-
 		//
 		log struct {
+
 			// The queue of logs, containing both flushed and unflushed logs. The
-			// flushed logs will be a prefix, the unflushed logs a suffix. The
-			// delimeter between flushed and unflushed logs is
-			// versionSet.minUnflushedLogNum.
+			// flushed logs will be a prefix, the unflushed logs a suffix.
+			// The delimeter between flushed and unflushed logs is versionSet.minUnflushedLogNum.
+			//
+			// 日志文件队列，包含 flushed 和 unflushed 的所有日志文件。
+			// flushed 和 unflushed 的日志之间的界限是 versionSet.minUnflushedLogNum 。
 			queue []fileInfo
+
 			// The number of input bytes to the log. This is the raw size of the
 			// batches written to the WAL, without the overhead of the record
 			// envelopes.
 			bytesIn uint64
+
 			// The LogWriter is protected by commitPipeline.mu. This allows log
 			// writes to be performed without holding DB.mu, but requires both
 			// commitPipeline.mu and DB.mu to be held when rotating the WAL/memtable
@@ -1822,18 +1826,30 @@ func (d *DB) newFlushableEntry(f flushable, logNum FileNum, logSeqNum uint64) *f
 //	最后会将当前 memtable 切换为 immutable 并加入到 queue 中。
 //
 //	最后将 immutable 解引用，并调用 maybeScheduleFlush 触发写入操作。
+//
+//
+//
+//
+// makeRoomForWrite 主要逻辑：
+//	当前 memtable 空间足够，直接写入
+//	当前 memtable 空间不够，将当前 memtable 切换为 immutable memtable ，然后将当前 memtable 刷盘
+//	batch 为空或者为 large batch 则直接切换当前 memtable（注：这两种视为非常规 batch ）
+//	如果切换 memtable 则同时会生成新的 log 文件
+//
 func (d *DB) makeRoomForWrite(b *Batch) error {
 	force := b == nil || b.flushable != nil
 	stalled := false
 	for {
 
-		// 检查当前 memTable 是否正在切换中
+		// 检查当前 memTable 是否正在切换中，如果是则等待当前 memtable 切换完毕；
 		if d.mu.mem.switching {
 			d.mu.mem.cond.Wait()
 			continue
 		}
 
-		// batch 为正常小数据量时，进入 prepare
+		// 判断当前 batch 是否为常规 batch，如果为常规 batch ，
+		// 则调用 memtable 的 prepare 函数判断当前 batch 空间是否足够，
+		// 如果足够则直接返回，否则返回 ErrArenaFull，代表空间已满；
 		if b != nil && b.flushable == nil {
 			err := d.mu.mem.mutable.prepare(b)
 			if err != arenaskl.ErrArenaFull {
@@ -1850,12 +1866,18 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 		}
 
 
+		// 下面进入切换 memtable 的逻辑，到这里可以看出，有三种情况会切换 memtable ：
+		// 1. 手动 flush，
+		// 2. Large batch
+		// 3. 当前 memtable 已满；
+
+
 		// force || err == ErrArenaFull, so we need to rotate the current memtable.
 		{
 
 			var size uint64
 
-			// 计算所有 memTable 大小
+			// 计算当前内存所有 memTable 的空间大小
 			for i := range d.mu.mem.queue {
 				size += d.mu.mem.queue[i].totalBytes()
 			}
@@ -1890,6 +1912,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			continue
 		}
 
+
 		var newLogNum FileNum
 		var newLogFile vfs.File
 		var newLogSize uint64
@@ -1897,16 +1920,19 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 		var err error
 
 		if !d.opts.DisableWAL {
+
 			jobID := d.mu.nextJobID
 			d.mu.nextJobID++
 			newLogNum = d.mu.versions.getNextFileNum()
 			d.mu.mem.switching = true
 
+			// 当前日志文件大小
 			prevLogSize = uint64(d.mu.log.Size())
 
 			// The previous log may have grown past its original physical
 			// size. Update its file size in the queue so we have a proper
 			// accounting of its file size.
+			//
 			if d.mu.log.queue[len(d.mu.log.queue)-1].fileSize < prevLogSize {
 				d.mu.log.queue[len(d.mu.log.queue)-1].fileSize = prevLogSize
 			}
@@ -1917,8 +1943,13 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			// close the previous log before linking the new log file,
 			// otherwise a crash could leave both logs with unclean tails, and
 			// Open will treat the previous log as corrupt.
+			//
+			// 关闭当前日志，这会写入一个 EOF 标记然后 flush 到磁盘。
+			// 我们必须关闭上一个 log ，然后链接到新 log ，否则 crash 会导致
 			err = d.mu.log.Close()
 
+
+			// 创建新日志文件
 			newLogName := base.MakeFilepath(d.opts.FS, d.walDirname, fileTypeLog, newLogNum)
 
 			// Try to use a recycled log file. Recycling log files is an important
@@ -1927,6 +1958,8 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			// time. This is due to the need to sync file metadata when a file is
 			// being written for the first time. Note this is true even if file
 			// preallocation is performed (e.g. fallocate).
+			//
+			// 尝试重用日志文件。
 			var recycleLog fileInfo
 			var recycleOK bool
 			if err == nil {
@@ -1976,6 +2009,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				err = firstError(err, d.logRecycler.pop(recycleLog.fileNum))
 			}
 
+			// 事件回调
 			d.opts.EventListener.WALCreated(WALCreateInfo{
 				JobID:           jobID,
 				Path:            newLogName,
@@ -2001,11 +2035,15 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 		}
 
 		if !d.opts.DisableWAL {
+			// 保存 log info 到 queue
 			d.mu.log.queue = append(d.mu.log.queue, fileInfo{fileNum: newLogNum, fileSize: newLogSize})
+			// 构造 log writer ，用于写入 wal 日志
 			d.mu.log.LogWriter = record.NewLogWriter(newLogFile, newLogNum)
 			d.mu.log.LogWriter.SetMinSyncInterval(d.opts.WALMinSyncInterval)
 		}
 
+
+		//
 		immMem := d.mu.mem.mutable
 		imm := d.mu.mem.queue[len(d.mu.mem.queue)-1]
 		imm.logSize = prevLogSize

@@ -677,8 +677,6 @@ func (w *LogWriter) flushPending(
 	data []byte, pending []*block, head, tail uint32,
 ) (synced bool, err error) {
 
-
-
 	defer func() {
 		// Translate panics into errors. The errors will cause flushLoop to shut
 		// down, but allows us to do so in a controlled way and avoid swallowing
