@@ -25,6 +25,8 @@ import (
 
 // get gets the value for the given key. It returns ErrNotFound if the DB does
 // not contain the key.
+//
+// memTable的get方法用于查找对应的key
 func (m *memTable) get(key []byte) (value []byte, err error) {
 	it := m.skl.NewIter(nil, nil)
 	ikey, val := it.SeekGE(key, false /* trySeekUsingNext */)

@@ -863,7 +863,7 @@ func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
 //
 func (d *DB) commitApply(b *Batch, mem *memTable) error {
 
-	// 如果是 Large batch ，直接 return 。
+		// 如果是 Large batch ，直接 return 。
 		if b.flushable != nil {
 			// This is a large batch which was already added to the immutable queue.
 			return nil

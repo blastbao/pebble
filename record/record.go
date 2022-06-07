@@ -21,8 +21,10 @@
 // Example code:
 //	func read(r io.Reader) ([]string, error) {
 //		var ss []string
+//    // 构造 reader
 //		records := record.NewReader(r)
 //		for {
+//			// 不断读取
 //			rec, err := records.Next()
 //			if err == io.EOF {
 //				break
@@ -96,6 +98,29 @@
 // The wire format allows for limited recovery in the face of data corruption:
 // on a format error (such as a checksum mismatch), the reader moves to the
 // next block and looks for the next full or first chunk.
+//
+// 有两种块格式：legacy 和 recyclable 。
+//
+// legacy :
+//   +----------+-----------+-----------+--- ... ---+
+//   | CRC (4B) | Size (2B) | Type (1B) | Payload   |
+//   +----------+-----------+-----------+--- ... ---+
+// 其中 Type 有四种:
+//		- fullChunkType
+//		- firstChunkType
+//		- middleChunkType
+//		- lastChunkType
+//
+// recyclyable:
+//	 同 legacy 格式类似，只是增加了 Log number 字段。
+//   +----------+-----------+-----------+----------------+--- ... ---+
+//   | CRC (4B) | Size (2B) | Type (1B) | Log number (4B)| Payload   |
+//   +----------+-----------+-----------+----------------+--- ... ---+
+//
+//   这允许重复使用（回收）日志文件，这可以在频繁同步时提供明显更好的性能，因为它避免了需要更新文件元数据。
+//   此外，回收日志文件是使用直接 IO 写入日志的前提。
+//
+//
 package record
 
 // The C++ Level-DB code calls this the log, but it has been renamed to record
@@ -126,10 +151,10 @@ const (
 )
 
 const (
-	blockSize            = 32 * 1024						// 块大小，不会超过这个值
-	blockSizeMask        = blockSize - 1
-	legacyHeaderSize     = 7
-	recyclableHeaderSize = legacyHeaderSize + 4 // 11 = 7 + 4
+	blockSize            = 32 * 1024            // 块大小 32KB
+	blockSizeMask        = blockSize - 1        // 块偏移掩码，通过 offset & blockSizeMask、offset &^ blockSizeMask 计算块、记录的偏移
+	legacyHeaderSize     = 7                    // legacy 类型块的 header 长度
+	recyclableHeaderSize = legacyHeaderSize + 4 // recyclable 类型块的 header 长度
 )
 
 var (
@@ -160,26 +185,54 @@ func IsInvalidRecord(err error) bool {
 type Reader struct {
 	// r is the underlying reader.
 	r io.Reader
+
 	// logNum is the low 32-bits of the log's file number. May be zero when used
 	// with log files that do not have a file number (e.g. the MANIFEST).
+	//
+	// 日志的文件号的低 32 位。
+	// 当用于没有文件号的日志文件时（例如 MANIFEST ），可以是 0 。
 	logNum uint32
+
 	// blockNum is the zero based block number currently held in buf.
+	//
+	// blockNum 是当前保存在 buf 中的块编号(从 0 开始)。
 	blockNum int64
+
 	// seq is the sequence number of the current record.
+	//
+	// 当前记录序号。
 	seq int
-	// buf[begin:end] is the unread portion of the current chunk's payload. The
-	// low bound, begin, excludes the chunk header.
+
+	// buf[begin:end] is the unread portion of the current chunk's payload.
+	// The low bound, begin, excludes the chunk header.
+	//
+	// buf[begin:end] 是当前块的有效载荷的未读部分。
 	begin, end int
+
 	// n is the number of bytes of buf that are valid. Once reading has started,
 	// only the final block can have n < blockSize.
+	//
+	// n 是 buf 的有效字节数。一旦开始读取，只有最后一个块可以有 n<blockSize 。
 	n int
+
 	// recovering is true when recovering from corruption.
+	//
+	// 正在从崩溃中恢复。
 	recovering bool
+
 	// last is whether the current chunk is the last chunk of the record.
+	//
+	// 当前块是否是该记录的最后一块
 	last bool
+
 	// err is any accumulated error.
+	//
+	// 累计错误
 	err error
+
 	// buf is the buffer.
+	//
+	// 缓存
 	buf [blockSize]byte
 }
 
@@ -196,39 +249,64 @@ func NewReader(r io.Reader, logNum base.FileNum) *Reader {
 
 // nextChunk sets r.buf[r.i:r.j] to hold the next chunk's payload, reading the
 // next block into the buffer if necessary.
+//
+// nextChunk 让 r.buf[r.i:r.j] 存储下一个块的有效载荷，如果有必要，将下一个块读入缓冲区。
 func (r *Reader) nextChunk(wantFirst bool) error {
+
 	for {
+
+		// 当前块为 r.buf[r.begin, r.end] ，需要更新 r.begin/r.end 来移动到下个块。
+
+		// 如果当前块后有足够一个 legacy header 的数据，就解析这个 Header 。
 		if r.end+legacyHeaderSize <= r.n {
+
+			// +----------+-----------+-----------+--- ... ---+
+			// | CRC (4B) | Size (2B) | Type (1B) | Payload   |
+			// +----------+-----------+-----------+--- ... ---+
+
 			checksum := binary.LittleEndian.Uint32(r.buf[r.end+0 : r.end+4])
 			length := binary.LittleEndian.Uint16(r.buf[r.end+4 : r.end+6])
 			chunkType := r.buf[r.end+6]
 
+			// 空白块
 			if checksum == 0 && length == 0 && chunkType == 0 {
+
+				// 如果不足一个 recyclable header 的大小，则跳过该块的其余部分。
 				if r.end+recyclableHeaderSize > r.n {
 					// Skip the rest of the block if the recyclable header size does not
 					// fit within it.
 					r.end = r.n
 					continue
 				}
+
+				// 正在恢复中
 				if r.recovering {
-					// Skip the rest of the block, if it looks like it is all
-					// zeroes. This is common with WAL preallocation.
+					// Skip the rest of the block, if it looks like it is all zeroes.
+					// This is common with WAL preallocation.
 					//
 					// Set r.err to be an error so r.recover actually recovers.
 					r.err = ErrZeroedChunk
 					r.recover()
 					continue
 				}
+
 				return ErrZeroedChunk
 			}
 
+			// 默认是 legacy 块
 			headerSize := legacyHeaderSize
+
+			// 如果是 recyclable 块
 			if chunkType >= recyclableFullChunkType && chunkType <= recyclableLastChunkType {
+
 				headerSize = recyclableHeaderSize
+
+				// 数据不足，块非法
 				if r.end+headerSize > r.n {
 					return ErrInvalidChunk
 				}
 
+				// 解析 log num
 				logNum := binary.LittleEndian.Uint32(r.buf[r.end+7 : r.end+11])
 				if logNum != r.logNum {
 					if wantFirst {
@@ -241,11 +319,17 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 					return ErrInvalidChunk
 				}
 
+				// 将 recyclable 转换为对应的 legacy 块类型
 				chunkType -= (recyclableFullChunkType - 1)
 			}
 
+
+			// begin 指向下一个 chunk 的有效载荷部分（忽略头部）
 			r.begin = r.end + headerSize
+			// end 指向下一个的结尾
 			r.end = r.begin + int(length)
+
+			// 如果缓存数据不足，报错
 			if r.end > r.n {
 				if r.recovering {
 					r.recover()
@@ -253,6 +337,8 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 				}
 				return ErrInvalidChunk
 			}
+
+			// 校验 crc
 			if checksum != crc.New(r.buf[r.begin-headerSize+6:r.end]).Value() {
 				if r.recovering {
 					r.recover()
@@ -260,15 +346,21 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 				}
 				return ErrInvalidChunk
 			}
+
+			//
 			if wantFirst {
 				if chunkType != fullChunkType && chunkType != firstChunkType {
 					continue
 				}
 			}
+
+
 			r.last = chunkType == fullChunkType || chunkType == lastChunkType
 			r.recovering = false
 			return nil
 		}
+
+		//
 		if r.n < blockSize && r.blockNum >= 0 {
 			if !wantFirst || r.end != r.n {
 				// This can happen if the previous instance of the log ended with a
@@ -278,6 +370,8 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 			}
 			return io.EOF
 		}
+
+		// 从 r.r 读取数据到 r.buf 中，返回字节数
 		n, err := io.ReadFull(r.r, r.buf[:])
 		if err != nil && err != io.ErrUnexpectedEOF {
 			if err == io.EOF && !wantFirst {
@@ -285,7 +379,10 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 			}
 			return err
 		}
+
+		// 重置 begin/end/n 变量
 		r.begin, r.end, r.n = 0, 0, n
+		// 增加块计数
 		r.blockNum++
 	}
 }
@@ -293,16 +390,25 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 // Next returns a reader for the next record. It returns io.EOF if there are no
 // more records. The reader returned becomes stale after the next Next call,
 // and should no longer be used.
+//
+//
 func (r *Reader) Next() (io.Reader, error) {
+	// 序号 +1
 	r.seq++
+
+	// 错误检查
 	if r.err != nil {
 		return nil, r.err
 	}
+
+	// 移动到下个 chunk
 	r.begin = r.end
 	r.err = r.nextChunk(true)
 	if r.err != nil {
 		return nil, r.err
 	}
+
+	// 封装 reader
 	return singleReader{r, r.seq}, nil
 }
 
@@ -362,8 +468,13 @@ func (r *Reader) seekRecord(offset int64) error {
 	}
 
 	// Only seek to an exact block offset.
-	c := int(offset & blockSizeMask)
-	if _, r.err = s.Seek(offset&^blockSizeMask, io.SeekStart); r.err != nil {
+	// 块内记录偏移
+	recordOffset := int(offset & blockSizeMask)
+	// 块偏移
+	blockOffset := offset &^ blockSizeMask
+
+	// 先 seek 到块偏移，然后根据块内记录偏移即可定位到 record
+	if _, r.err = s.Seek(blockOffset, io.SeekStart); r.err != nil {
 		return r.err
 	}
 
@@ -376,7 +487,7 @@ func (r *Reader) seekRecord(offset int64) error {
 
 	// Now skip to the offset requested within the block. A subsequent
 	// call to Next will return the block at the requested offset.
-	r.begin, r.end = c, c
+	r.begin, r.end = recordOffset, recordOffset
 
 	return nil
 }

@@ -78,6 +78,14 @@ func (it *Iterator) Error() error {
 // pointing at a valid entry, and (nil, nil) otherwise. Note that SeekGE only
 // checks the upper bound. It is up to the caller to ensure that key is greater
 // than or equal to the lower bound.
+//
+// 大于或者等于查找key的kv值
+//
+// 查找算法：
+//	从跳跃表的最大高度开始，对每层进行查找
+//	如果找到，判断是否层数为0
+//	如果层数为0，则查找结束
+//	如果层数不为0，则找到第0层对应节点的prev节点，结束
 func (it *Iterator) SeekGE(key []byte, trySeekUsingNext bool) (*base.InternalKey, []byte) {
 	if trySeekUsingNext {
 		if it.nd == it.list.tail {

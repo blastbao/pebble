@@ -75,11 +75,18 @@ var ErrRecordExists = errors.New("record with this key already exists")
 // entries that shadow existing entries and perform deletion via tombstones. It
 // is up to the user to process these shadow entries and tombstones
 // appropriately during retrieval.
+//
+// 跳跃表是一个快速，并发的实现支持向前，向后遍历。
+// 键值一旦被加入到跳跃表中，就是不可变的，不支持删除。
+//
+// 值得注意的是，节点分配内存，前后指针等，都是在固定区域的内存中分配，指针都是通过偏移来实现。
 type Skiplist struct {
 	arena  *Arena
 	cmp    base.Compare
 	head   *node
 	tail   *node
+
+	// 当前高度 1 <= height <= maxHeight. CAS.
 	height uint32 // Current height. 1 <= height <= maxHeight. CAS.
 
 	// If set to true by tests, then extra delays are added to make it easier to
@@ -171,6 +178,36 @@ func (s *Skiplist) Add(key base.InternalKey, value []byte) error {
 	return s.addInternal(key, value, &ins)
 }
 
+
+
+// 插入
+//	随机选择一个新插入节点的高度，层数越高，概率约小，指数下降。
+//	找出每层需要插入的位置，第0层到第h层的位置都找到需要找到。
+//	然后生成新的节点，根据已经找到的插入位置，修改新节点中每层的前后指针，指向正确的位置。
+//	然后通过无锁方法，将每层的链表中的前后指针指向新节点。处理完成。
+//
+// 无锁
+//	从第0层到第h层，每一层通过双向链表的无锁CAS实现：
+//
+//
+//	+----------------+     +------------+     +----------------+
+//	|      prev      |     |     nd     |     |      next      |
+//	| prevNextOffset |---->|            |     |                |
+//	|                |<----| prevOffset |     |                |
+//	|                |     | nextOffset |---->|                |
+//	|                |     |            |<----| nextPrevOffset |
+//	+----------------+     +------------+     +----------------+
+//
+//	1. 初始化 prevOffset 和 nextOffset 指向 prev 和 next.
+//	2. 通过 CAS 操作将 prevNextOffset 从 next 重新指向 nd.
+//	3. 通过 CAS 操作将 nextPrevOffset 从 prev 重新指向 nd.
+//
+// 检查next是否有了一个更新后的连接指向prev。如果没有，意味着下面的两种情况：
+//   - 加入next的线程还米有计划添加prev链接（但是很短的时间之后会添加）
+//	 - 另一个线程已经在prev和next之间加了一个新连接
+//
+// 操作过程出现冲突的情况，需要重新定位插入位置，前后指针信息，然后再次插入，如果有一个新的相同key插入了，则报错已存在，然后退出。
+//
 func (s *Skiplist) addInternal(key base.InternalKey, value []byte, ins *Inserter) error {
 	if s.findSplice(key, ins) {
 		// Found a matching node, but handle case where it's been deleted.
@@ -299,6 +336,8 @@ func (s *Skiplist) addInternal(key base.InternalKey, value []byte, ins *Inserter
 // bound is not checked on {SeekGE,First} and upper bound is not check on
 // {SeekLT,Last}. The user is expected to perform that check. Note that it is
 // safe for an iterator to be copied by value.
+//
+// 迭代器
 func (s *Skiplist) NewIter(lower, upper []byte) *Iterator {
 	it := iterPool.Get().(*Iterator)
 	*it = Iterator{list: s, nd: s.head, lower: lower, upper: upper}

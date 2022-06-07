@@ -463,18 +463,21 @@ func (b *Batch) Apply(batch *Batch, _ *WriteOptions) error {
 // slice will remain valid until the returned Closer is closed. On success, the
 // caller MUST call closer.Close() or a memory leak will occur.
 func (b *Batch) Get(key []byte) ([]byte, io.Closer, error) {
-	//
 	if b.index == nil {
 		return nil, nil, ErrNotIndexed
 	}
-	//
+	// 将请求传递给 db
 	return b.db.getInternal(key, b, nil /* snapshot */)
 }
 
 func (b *Batch) prepareDeferredKeyValueRecord(keyLen, valueLen int, kind InternalKeyKind) {
+
+	// 初始化 batch
 	if len(b.data) == 0 {
 		b.init(keyLen + valueLen + 2*binary.MaxVarintLen64 + batchHeaderLen)
 	}
+
+
 	b.count++
 	b.memTableSize += memTableEntrySize(keyLen, valueLen)
 
@@ -561,16 +564,22 @@ func (b *Batch) prepareDeferredKeyRecord(keyLen int, kind InternalKeyKind) {
 //
 // It is safe to modify the contents of the arguments after Set returns.
 func (b *Batch) Set(key, value []byte, _ *WriteOptions) error {
+
+	//
 	deferredOp := b.SetDeferred(len(key), len(value))
+
 	copy(deferredOp.Key, key)
 	copy(deferredOp.Value, value)
+
 	// TODO(peter): Manually inline DeferredBatchOp.Finish(). Mid-stack inlining
 	// in go1.13 will remove the need for this.
 	if b.index != nil {
+		// 添加到索引
 		if err := b.index.Add(deferredOp.offset); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -992,6 +1001,7 @@ func (b *Batch) Indexed() bool {
 	return b.index != nil
 }
 
+// 初始化底层存储 data 和一些变量
 func (b *Batch) init(cap int) {
 	n := batchInitialSize
 	for n < cap {

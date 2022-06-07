@@ -176,6 +176,10 @@ func (w *tableFilterWriter) Finish(buf []byte) []byte {
 //
 // It is valid to use the other API in this package (pebble/bloom) without
 // using this type or the pebble package.
+//
+//
+// FilterPolicy 实现了 pebble 包中的 FilterPolicy 接口。
+//
 type FilterPolicy int
 
 // Name implements the pebble.FilterPolicy interface.

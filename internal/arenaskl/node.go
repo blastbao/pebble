@@ -30,6 +30,7 @@ func MaxNodeSize(keySize, valueSize uint32) uint32 {
 	return uint32(maxNodeSize) + keySize + valueSize + align4
 }
 
+// 链接信息
 type links struct {
 	nextOffset uint32
 	prevOffset uint32
@@ -42,6 +43,7 @@ func (l *links) init(prevOffset, nextOffset uint32) {
 
 type node struct {
 	// Immutable fields, so no need to lock to access key.
+	// 不可变字段，所以不需要对其加锁访问
 	keyOffset uint32
 	keySize   uint32
 	valueSize uint32
@@ -54,6 +56,12 @@ type node struct {
 	// is deliberately truncated to not include unneeded tower elements.
 	//
 	// All accesses to elements should use CAS operations, with no need to lock.
+	//
+	// 每个节点都有 maxHeight 高度个链表，用于指向每层的下一个或者上一个节点，用于加速查找
+	// 大部分节点不需要塔的全部高度，因为每个连续层的概率指数下降。
+	// 因为这些元素永远不会被访问，不需要被分配。
+	// 因此，当在区域中分配节点时，其内存占用被截断，不包括不需要的塔元素。
+	// 所有元素的访问都应该使用 CAS 操作，而不需要锁定。
 	tower [maxHeight]links
 }
 

@@ -22,7 +22,6 @@ var walSyncLabels = pprof.Labels("pebble", "wal-sync")
 
 //
 type block struct {
-
 	// buf[:written] has already been filled with fragments. Updated atomically.
 	// 在 written 之前的数据已经拷贝到缓存中了，准备被 flush 。
 	written int32
@@ -31,7 +30,7 @@ type block struct {
 	// 在 flushed 之前的数据已经被 flush 了。
 	flushed int32
 
-	buf [blockSize]byte
+	buf [blockSize]byte // 32 KB
 }
 
 type flusher interface {
@@ -63,7 +62,7 @@ type syncSlot struct {
 // available *sync.WaitGroup elements.
 //
 // syncQueue 是一个无锁的固定大小的单生产者、单消费者队列。
-// 单生产者可以向头部推送，而单消费者可以从尾部弹出多个值。。
+// 单生产者可以向头部推送，而单消费者可以从尾部弹出多个值。
 type syncQueue struct {
 
 	// headTail packs together a 32-bit head index and a 32-bit tail index.
@@ -286,7 +285,6 @@ type syncTimer interface {
 // CRC 和 Size 之后的 Type 用来标识当前 Block 是多个 Block 中的 Full / First / Middle / Last，
 // 而 Log Number 则是帮助复用 WAL 的递增 Log Number。
 //
-//
 // 根据要写入的格式我们知道 SyncRecord 和 LogWriter 需要做的本质上即将 Batch 的数据根据切分
 // 为不超过 BlockSize(32 KiB) 的多个 Block，每个 Block 附上 CRC / Size / Type 以及当前
 // 的 Log Number 并写入日志文件即可，而 emitFragment 方法主要也处理切 block 的逻辑，
@@ -298,11 +296,7 @@ type syncTimer interface {
 // 的 blocks 数组中，每当需要新 Block 时会首先尝试从 free.blocks 中复用，如果没有且当前已分配的少于 16 (硬编码)
 // 会先直接 new， 如果已经分配过 16 个则会等待 sync.Cond。
 //
-//
-//
 
-//
-//
 //
 // LogWriter writes records to an underlying io.Writer. In order to support WAL
 // file reuse, a LogWriter's records are tagged with the WAL's file
@@ -398,14 +392,22 @@ func NewLogWriter(w io.Writer, logNum base.FileNum) *LogWriter {
 		w: w,
 		c: c,
 		s: s,
+
 		// NB: we truncate the 64-bit log number to 32-bits. This is ok because a)
 		// we are very unlikely to reach a file number of 4 billion and b) the log
 		// number is used as a validation check and using only the low 32-bits is
 		// sufficient for that purpose.
+		//
+		// 我们将 64 位的 log num 截断为 32 位，这是可行的，因为
+		//  a）不太可能达到 40 亿的文件数；
+		//  b）日志号被用作验证检查，只使用低 32 位就可以达到这个目的。
 		logNum: uint32(logNum),
+
+		// 回调
 		afterFunc: func(d time.Duration, f func()) syncTimer {
 			return time.AfterFunc(d, f)
 		},
+
 	}
 
 	r.free.cond.L = &r.free.Mutex					// 初始化 sync.Cond && sync.Mutex
@@ -417,6 +419,8 @@ func NewLogWriter(w io.Writer, logNum base.FileNum) *LogWriter {
 	r.flusher.closed = make(chan struct{})
 	r.flusher.pending = make([]*block, 0, cap(r.free.blocks))
 
+
+	//
 	go func() {
 		pprof.Do(context.Background(), walSyncLabels, r.flushLoop)
 	}()
@@ -734,6 +738,7 @@ func (w *LogWriter) flushBlock(b *block) error {
 // queueBlock queues the current block for writing to the underlying writer,
 // allocates a new block and reserves space for the next header.
 //
+// 把当前正在写的 block 写入到 flush 队列，然后获取一个新的空闲 block 作为当前可写的 block 。
 //
 func (w *LogWriter) queueBlock() {
 
@@ -849,13 +854,14 @@ func (w *LogWriter) WriteRecord(p []byte) (int64, error) {
 // SyncRecord 需要做的本质上即将 Batch 的数据根据切分为不超过 BlockSize(32 KiB) 的多个 Block，
 // 每个 Block 附上 CRC / Size / Type 以及当前的 Log Number 并写入日志文件即可。
 //
+// SyncRecord 返回当前已写入数据的总长度，包含本次写入的数据。
+//
 //
 // 通过 emitFragment 方法将 Batch 数据写入当前 Block 或分多 Block 推入 Pending，
 // 每新产生新 Block 时让 flushLoop 异步开始进行 Flush Write 到操作系统 PageCache，
 // 在整个记录都写入完成后追加 WaitGroup 到 syncQ 触发 flushLoop 对前面写入的数据异步 Sync 到磁盘，
 // SyncRecord 不用等待 Sync 完成既可以返回，后面需要“确保 Sync 完成”的逻辑可以通过 WaitGroup Wait 来保证。
 func (w *LogWriter) SyncRecord(p []byte, wg *sync.WaitGroup, err *error) (int64, error) {
-
 	if w.err != nil {
 		return -1, w.err
 	}
@@ -865,8 +871,10 @@ func (w *LogWriter) SyncRecord(p []byte, wg *sync.WaitGroup, err *error) (int64,
 	// MANIFEST is currently written using Writer, it is good to support the same
 	// semantics with LogWriter.
 	//
-	// 切分数据放到片段中
+	// 不断的将 p 写入到文件，因为底层是分块的，一次最多写入一个块，所以需要连续写多次，每次写入的数据分片称作 fragment 。
 	for i := 0; i == 0 || len(p) > 0; i++ {
+		// i 代表当前是第几个 fragment
+		// p 代表剩余待写入的数据
 		p = w.emitFragment(i, p)
 	}
 
@@ -917,7 +925,10 @@ func (w *LogWriter) emitEOFTrailer() {
 	atomic.StoreInt32(&b.written, i+int32(recyclableHeaderSize))
 }
 
-// 将 Batch 数据写入当前 Block 或分多 Block 推入到 w.flusher.pending 中，并通知后台 flush 。
+// 将 Batch 数据 p[]byte 写入当前 Block ，如果一个 block 不足以容纳，
+// 会写连续的多个 Block ，每写满一个 Block 会将其推入到 w.flusher.pending 中，并通知后台 flush 。
+//
+//
 func (w *LogWriter) emitFragment(n int, p []byte) []byte {
 	// 当前 block
 	b := w.block
@@ -929,16 +940,20 @@ func (w *LogWriter) emitFragment(n int, p []byte) []byte {
 	// 最后 fragment
 	last := blockSize-i-recyclableHeaderSize >= int32(len(p))
 
-
 	///// 向 b.buf[] 中写入数据
 
-	// 写入 Type
+	// 写入 Block Type
+
+	// 如果是最后的 block ，则可能是 full/last 。
 	if last {
+		// 如果既是 first 又是 last ，就意味着是一个完整的 block ，即为 full 类型
 		if first {
 			b.buf[i+6] = recyclableFullChunkType
+		// 否则，指定是 last 类型
 		} else {
 			b.buf[i+6] = recyclableLastChunkType
 		}
+	// 如果不是最后的 block ，则可能是 first/middle 。
 	} else {
 		if first {
 			b.buf[i+6] = recyclableFirstChunkType
